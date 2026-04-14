@@ -147,8 +147,9 @@ async function handleNLP(msg) {
     case "bias_only": {
       const instruments = scanner.resolveInstruments(intent);
       if (!instruments.length) { await safeSend(chatId, "Couldn't find those instruments."); break; }
-      await safeSend(chatId, "Scanning bias on " + instruments.length + " instrument(s)...");
-      const results = await scanner.scanBiasOnly(instruments);
+      await safeSend(chatId, "🔍 Scanning bias on " + instruments.length + " instrument(s)...");
+      const biasProgress = async (msg) => { await safeSend(chatId, msg); };
+      const results = await scanner.scanBiasOnly(instruments, biasProgress);
       for (const { symbol, biasMap, error } of results) {
         if (error || !biasMap) { await safeSend(chatId, "❌ " + symbol + ": " + (error || "no data")); continue; }
         await safeSend(chatId, formatBiasOnly(symbol, biasMap));
@@ -181,9 +182,18 @@ async function handleNLP(msg) {
 
 async function runScanAndDeliver(chatId, instruments, outputMode) {
   const count = instruments.length;
-  await safeSend(chatId, "Scanning " + count + " instrument(s)...");
+  await safeSend(chatId, "🔍 Scanning " + count + " instrument(s)...");
 
-  const results = await scanner.scanInstruments(instruments);
+  // Progress callback — sends live updates to chat during scan
+  let lastProgress = "";
+  const onProgress = async (msg) => {
+    if (msg !== lastProgress) {
+      lastProgress = msg;
+      await safeSend(chatId, msg);
+    }
+  };
+
+  const results = await scanner.scanInstruments(instruments, onProgress);
 
   await safeSend(chatId, formatScanSummary(results, outputMode));
   await sleep(300);
