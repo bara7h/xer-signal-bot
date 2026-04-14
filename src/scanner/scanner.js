@@ -19,9 +19,12 @@ let currentMode = process.env.DEFAULT_MODE || "3step";
 /** Active signals map: key = `${symbol}_${stackId}`, value = signal object */
 const activeSignals = new Map();
 
-/** Cooldown map: prevent duplicate alerts for same setup */
+/** Cooldown map: prevent duplicate alerts for same setup + bias direction
+ *  Key format: `${symbol}_${stackId}_${mode}_${bias}` 
+ *  This means BULLISH and BEARISH on the same instrument fire independently
+ */
 const signalCooldowns = new Map();
-const COOLDOWN_MS = 4 * 60 * 60 * 1000; // 4 hours per symbol/stack
+const COOLDOWN_MS = 4 * 60 * 60 * 1000; // 4 hours per symbol/stack/bias
 
 /** Signal event listeners */
 const signalListeners = [];
@@ -106,13 +109,9 @@ async function runScanCycle() {
  */
 async function scanInstrumentStack(instrument, stack) {
   const { symbol, displayName } = instrument;
-  const signalKey = `${symbol}_${stack.id}_${currentMode}`;
-
-  // Check cooldown
-  if (isOnCooldown(signalKey)) {
-    logger.debug(`[${displayName}][${stack.id}] On cooldown — skipping`);
-    return;
-  }
+  // Cooldown key includes bias direction — checked after signal is generated
+  // so BULLISH and BEARISH setups on same instrument can both fire independently
+  const signalKeyBase = `${symbol}_${stack.id}_${currentMode}`;
 
   try {
     // Fetch current price
@@ -159,6 +158,15 @@ async function scanInstrumentStack(instrument, stack) {
     }
 
     if (signal) {
+      // Key includes bias — BULLISH and BEARISH tracked independently
+      const signalKey = `${signalKeyBase}_${signal.bias}`;
+
+      // Check cooldown AFTER we know the bias direction
+      if (isOnCooldown(signalKey)) {
+        logger.debug(`[${displayName}][${stack.id}][${signal.bias}] On cooldown — skipping`);
+        return;
+      }
+
       // Store active signal
       activeSignals.set(signalKey, signal);
 
@@ -196,10 +204,11 @@ async function scanSymbol(symbolOrDisplay) {
 
   for (const stack of stacks) {
     await scanInstrumentStack(instrument, stack);
-    const key = `${instrument.symbol}_${stack.id}_${currentMode}`;
-    if (activeSignals.has(key)) {
-      results.push(activeSignals.get(key));
-    }
+    // Check both bias directions in active signals
+    const keyBull = `${instrument.symbol}_${stack.id}_${currentMode}_BULLISH`;
+    const keyBear = `${instrument.symbol}_${stack.id}_${currentMode}_BEARISH`;
+    if (activeSignals.has(keyBull)) results.push(activeSignals.get(keyBull));
+    if (activeSignals.has(keyBear)) results.push(activeSignals.get(keyBear));
   }
 
   return results;
