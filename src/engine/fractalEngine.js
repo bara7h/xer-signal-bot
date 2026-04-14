@@ -62,8 +62,7 @@ async function runFullScan(symbol) {
   const signals = [];
   const analysisLog = []; // full step-by-step log for analysis mode
 
-  const currentPrice = await fetchCurrentPrice(symbol);
-  if (!currentPrice) return { signals, analysisLog, error: "Could not fetch price" };
+  let currentPrice = await fetchCurrentPrice(symbol);
 
   // ── Step 1: fetch all HTF candles and detect biases ───────────────────────
   const htfCandles = {};
@@ -72,6 +71,18 @@ async function runFullScan(symbol) {
   const htfFetches = await Promise.all(
     HTF_TIMEFRAMES.map(tf => fetchCandles(symbol, tf, 10))
   );
+
+  // If price fetch failed, derive from first available candle set
+  if (!currentPrice) {
+    for (const candles of htfFetches) {
+      if (candles && candles.length > 0) {
+        currentPrice = candles[candles.length - 1].close;
+        logger.warn("[" + symbol + "] Price derived from HTF candle: " + currentPrice);
+        break;
+      }
+    }
+    if (!currentPrice) return { signals, analysisLog, error: "Could not fetch price or candles for " + symbol };
+  }
 
   for (let i = 0; i < HTF_TIMEFRAMES.length; i++) {
     const tf = HTF_TIMEFRAMES[i];
