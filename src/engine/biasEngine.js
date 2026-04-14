@@ -1,252 +1,188 @@
 // ─────────────────────────────────────────────────────────────────────────────
-// XERO EDGE — Bias Engine
-// Implements EXACT C1/C2 bias rules + zone calculation + invalidation logic
+// XERO EDGE v2 — Bias Engine
+// Exact C1/C2 rules, zone calc, invalidation, recalculation, SL/TP
 // ─────────────────────────────────────────────────────────────────────────────
 
-const { FIBO_ZONES, RR_TARGETS } = require("../../config/markets");
+const { FIBO, RR, getSlBuffer } = require("../../config/markets");
 
-/**
- * BIAS DETECTION
- * Input: candles array (OHLC objects), newest last
- * Returns: { bias, C1, C2 } or null if no bias
- *
- * BULLISH — ALL must be true:
- *   C2.low  < C1.low
- *   C2.high < C1.high
- *   C2.close < C1.high
- *
- * BEARISH — ALL must be true:
- *   C2.high > C1.high
- *   C2.low  > C1.low
- *   C2.close > C1.low
- */
+// ── Bias Detection ────────────────────────────────────────────────────────────
+// C1 = candles[n-2], C2 = candles[n-1] (both closed)
+//
+// BULLISH — all three must be true:
+//   C2.low  < C1.low
+//   C2.high < C1.high
+//   C2.close < C1.high
+//
+// BEARISH — all three must be true:
+//   C2.high > C1.high
+//   C2.low  > C1.low
+//   C2.close > C1.low
+
 function detectBias(candles) {
   if (!candles || candles.length < 2) return null;
-
-  // C1 = second to last CLOSED candle, C2 = last CLOSED candle
-  // Index [0] is current forming candle — we ignore it if present
-  // The function expects candles already filtered to CLOSED only
   const C1 = candles[candles.length - 2];
   const C2 = candles[candles.length - 1];
-
   if (!C1 || !C2) return null;
 
   const bullish =
-    C2.low  < C1.low  &&
-    C2.high < C1.high &&
+    C2.low   < C1.low  &&
+    C2.high  < C1.high &&
     C2.close < C1.high;
 
   const bearish =
-    C2.high > C1.high &&
-    C2.low  > C1.low  &&
+    C2.high  > C1.high &&
+    C2.low   > C1.low  &&
     C2.close > C1.low;
 
-  if (bullish) return { bias: "BULLISH", C1, C2 };
-  if (bearish) return { bias: "BEARISH", C1, C2 };
-
+  if (bullish) return { bias: "BULLISH", C1, C2, passed: buildPassedChecks(C1, C2, "BULLISH") };
+  if (bearish) return { bias: "BEARISH", C1, C2, passed: buildPassedChecks(C1, C2, "BEARISH") };
   return null;
 }
 
-/**
- * CHECK BIAS INVALIDATION
- * Call after detecting initial bias.
- * Pass the candle(s) that formed AFTER the bias C2.
- *
- * BULLISH invalidation: any subsequent candle CLOSES above C2.high
- * BEARISH invalidation: any subsequent candle CLOSES below C2.low
- *
- * @param {object} biasResult - { bias, C1, C2 }
- * @param {array}  newCandles - candles formed after C2
- * @returns {boolean} true = invalidated
- */
+function buildPassedChecks(C1, C2, bias) {
+  if (bias === "BULLISH") return [
+    { check: "C2 low < C1 low",    pass: C2.low  < C1.low  },
+    { check: "C2 high < C1 high",  pass: C2.high < C1.high },
+    { check: "C2 close < C1 high", pass: C2.close < C1.high },
+  ];
+  return [
+    { check: "C2 high > C1 high",  pass: C2.high  > C1.high },
+    { check: "C2 low > C1 low",    pass: C2.low   > C1.low  },
+    { check: "C2 close > C1 low",  pass: C2.close > C1.low  },
+  ];
+}
+
+// ── Invalidation ──────────────────────────────────────────────────────────────
+// BULLISH invalidated: any subsequent candle closes ABOVE C2.high
+// BEARISH invalidated: any subsequent candle closes BELOW C2.low
+
 function checkInvalidation(biasResult, newCandles) {
-  if (!biasResult || !newCandles || newCandles.length === 0) return false;
-
+  if (!biasResult || !newCandles || !newCandles.length) return false;
   const { bias, C2 } = biasResult;
-
-  for (const candle of newCandles) {
-    if (bias === "BULLISH" && candle.close > C2.high) return true;
-    if (bias === "BEARISH" && candle.close < C2.low)  return true;
+  for (const c of newCandles) {
+    if (bias === "BULLISH" && c.close > C2.high) return true;
+    if (bias === "BEARISH" && c.close < C2.low)  return true;
   }
-
   return false;
 }
 
-/**
- * CALCULATE ENTRY ZONES (Fibonacci on C2 range)
- *
- * C2 range = C2.high - C2.low
- *
- * BULLISH zones (price retracing UP into discount):
- *   Zone 1: C2.low + range * 0.618  →  C2.low + range * 0.768
- *   Zone 2: C2.low to C2.low + range * 0.618  (deep discount, Zone2 LOW extreme)
- *            per spec: "Bullish → 0.768 to C2 low"
- *
- * BEARISH zones (price retracing DOWN into premium):
- *   Zone 1: C2.high - range * 0.768  →  C2.high - range * 0.618
- *   Zone 2: C2.high - range * 0.768  →  C2.high  (deep premium)
- *            per spec: "Bearish → 0.768 to C2 high"
- *
- * @param {object} biasResult - { bias, C1, C2 }
- * @returns {object} { zone1: {high, low}, zone2: {high, low}, midpoint }
- */
+// ── Zone Calculation ──────────────────────────────────────────────────────────
+// Fib applied to C2 range (C2.high - C2.low)
+//
+// BULLISH (expect retrace DOWN into discount):
+//   Zone1: C2.low + range*0.618  →  C2.low + range*0.768
+//   Zone2: C2.low               →  C2.low + range*0.618
+//
+// BEARISH (expect retrace UP into premium):
+//   Zone1: C2.high - range*0.768 →  C2.high - range*0.618
+//   Zone2: C2.high - range*0.618 →  C2.high
+
 function calculateZones(biasResult) {
-  const { bias, C2 } = biasResult;
+  const { bias, C1, C2 } = biasResult;
   const range = C2.high - C2.low;
 
   if (bias === "BULLISH") {
-    const zone1Low  = C2.low + range * FIBO_ZONES.ZONE1_LOW;   // 0.618
-    const zone1High = C2.low + range * FIBO_ZONES.ZONE1_HIGH;  // 0.768
-    const zone2Low  = C2.low;
-    const zone2High = zone1Low; // from C2 low up to 0.618
-
+    const z1lo = r(C2.low + range * FIBO.ZONE1_LOW);
+    const z1hi = r(C2.low + range * FIBO.ZONE1_HIGH);
     return {
-      bias,
-      zone1: { high: round(zone1High), low: round(zone1Low) },
-      zone2: { high: round(zone2High), low: round(zone2Low) },
-      C2High: C2.high,
-      C2Low:  C2.low,
-      C1High: biasResult.C1.high,
-      C1Low:  biasResult.C1.low,
+      bias, range: r(range),
+      zone1: { high: z1hi, low: z1lo },
+      zone2: { high: z1lo,  low: r(C2.low) },
+      C2High: C2.high, C2Low: C2.low,
+      C1High: C1.high, C1Low: C1.low,
+      recalculated: false,
     };
   }
 
   if (bias === "BEARISH") {
-    const zone1High = C2.high - range * FIBO_ZONES.ZONE1_LOW;  // 0.618 from top
-    const zone1Low  = C2.high - range * FIBO_ZONES.ZONE1_HIGH; // 0.768 from top
-    const zone2High = C2.high;
-    const zone2Low  = zone1High; // from 0.618 up to C2 high
-
+    const z1hi = r(C2.high - range * FIBO.ZONE1_LOW);
+    const z1lo = r(C2.high - range * FIBO.ZONE1_HIGH);
     return {
-      bias,
-      zone1: { high: round(zone1High), low: round(zone1Low) },
-      zone2: { high: round(zone2High), low: round(zone2Low) },
-      C2High: C2.high,
-      C2Low:  C2.low,
-      C1High: biasResult.C1.high,
-      C1Low:  biasResult.C1.low,
+      bias, range: r(range),
+      zone1: { high: z1hi, low: z1lo },
+      zone2: { high: r(C2.high), low: z1hi },
+      C2High: C2.high, C2Low: C2.low,
+      C1High: C1.high, C1Low: C1.low,
+      recalculated: false,
     };
   }
-
   return null;
 }
 
-/**
- * CHECK IF PRICE IS IN A ZONE
- * @param {number} price - current price
- * @param {object} zones - output of calculateZones()
- * @returns {string|null} "Zone1" | "Zone2" | null
- */
-function getPriceZone(price, zones) {
-  if (!zones) return null;
+// ── Zone Recalculation ────────────────────────────────────────────────────────
+// Trigger when ALL of:
+//   1. Price has NOT tapped Zone1
+//   2. Price moved beyond C2 extreme (above C2.high for bearish / below C2.low for bullish)
+//   3. Price is still within C1 range
+//
+// Action: recalculate Fib from the new reversal extreme → C2 anchor
+//   BULLISH: new range = reversal_low → C2.high  (price dipped below C2.low but bounced)
+//   BEARISH: new range = C2.low → reversal_high  (price spiked above C2.high but reversed)
 
-  if (price >= zones.zone1.low && price <= zones.zone1.high) return "Zone1";
-  if (price >= zones.zone2.low && price <= zones.zone2.high) return "Zone2";
-
-  return null;
-}
-
-/**
- * SPECIAL CONDITION — RECALCULATION
- * Trigger when:
- *   - Price did NOT tap Zone 1
- *   - Price moved beyond C2 extreme
- *   - Price still within C1 range
- *
- * Action: Recalculate zones using new swing point → C2 extreme
- *
- * @param {object} zones - original zones
- * @param {number} price - current price
- * @param {object} biasResult - { bias, C1, C2 }
- * @returns {object|null} new zones or null if recalc not needed
- */
 function checkRecalculation(zones, price, biasResult) {
   if (!zones || !biasResult) return null;
-
   const { bias, C1, C2 } = biasResult;
 
-  const inC1Range = price <= C1.high && price >= C1.low;
+  const inC1Range = price >= C1.low && price <= C1.high;
   if (!inC1Range) return null;
 
   const beyondC2 =
-    (bias === "BULLISH" && price < C2.low)  ||
+    (bias === "BULLISH" && price < C2.low) ||
     (bias === "BEARISH" && price > C2.high);
-
   if (!beyondC2) return null;
 
-  // New swing: use C2 extreme as new C2 boundary
-  const newC2 = {
-    high: bias === "BEARISH" ? price  : C2.high,
-    low:  bias === "BULLISH" ? price  : C2.low,
-    close: price,
-  };
+  // Build synthetic C2 using reversal point
+  const newC2 = bias === "BULLISH"
+    ? { high: C2.high, low: price,  close: price }
+    : { high: price,  low: C2.low,  close: price };
 
-  const newBiasResult = { bias, C1, C2: newC2 };
-  const newZones = calculateZones(newBiasResult);
+  const newZones = calculateZones({ bias, C1, C2: newC2 });
   if (newZones) newZones.recalculated = true;
-
   return newZones;
 }
 
-/**
- * CALCULATE STOP LOSS
- * 3-step: SL beyond MTF zone
- * 2-step: SL beyond HTF zone
- *
- * @param {string} bias   - "BULLISH" | "BEARISH"
- * @param {object} zones  - the reference zones (MTF or HTF)
- * @param {number} buffer - pip/point buffer (default 0)
- * @returns {number} stop loss price
- */
-function calculateStopLoss(bias, zones, buffer = 0) {
+// ── Price Zone Check ──────────────────────────────────────────────────────────
+function getPriceZone(price, zones) {
   if (!zones) return null;
-
-  if (bias === "BULLISH") {
-    // SL below zone2 low (deepest discount extreme)
-    return round(zones.zone2.low - buffer);
-  } else {
-    // SL above zone2 high (deepest premium extreme)
-    return round(zones.zone2.high + buffer);
-  }
+  if (price >= zones.zone1.low && price <= zones.zone1.high) return "Zone1";
+  if (price >= zones.zone2.low && price <= zones.zone2.high) return "Zone2";
+  return null;
 }
 
-/**
- * CALCULATE TAKE PROFIT LEVELS
- * TP1 = 1RR, TP2 = 2RR
- *
- * @param {string} bias  - "BULLISH" | "BEARISH"
- * @param {number} entry - entry price
- * @param {number} sl    - stop loss price
- * @returns {object} { tp1, tp2 }
- */
+// ── Stop Loss ─────────────────────────────────────────────────────────────────
+// 3-step: SL beyond MTF zone extreme
+// 2-step: SL beyond HTF zone extreme
+
+function calculateSL(bias, zones, symbol) {
+  const buf = getSlBuffer(symbol || "");
+  if (!zones) return null;
+  if (bias === "BULLISH") return r(zones.zone2.low - buf);
+  return r(zones.zone2.high + buf);
+}
+
+// ── Take Profit ───────────────────────────────────────────────────────────────
 function calculateTargets(bias, entry, sl) {
   const risk = Math.abs(entry - sl);
-
-  if (bias === "BULLISH") {
-    return {
-      tp1: round(entry + risk * RR_TARGETS.TP1),
-      tp2: round(entry + risk * RR_TARGETS.TP2),
-    };
-  } else {
-    return {
-      tp1: round(entry - risk * RR_TARGETS.TP1),
-      tp2: round(entry - risk * RR_TARGETS.TP2),
-    };
-  }
+  if (bias === "BULLISH") return {
+    tp1: r(entry + risk * RR.TP1),
+    tp2: r(entry + risk * RR.TP2),
+  };
+  return {
+    tp1: r(entry - risk * RR.TP1),
+    tp2: r(entry - risk * RR.TP2),
+  };
 }
 
-// ─── Helpers ─────────────────────────────────────────────────────────────────
+// ── Helpers ───────────────────────────────────────────────────────────────────
+function r(n, d = 5) { return Math.round(n * 10 ** d) / 10 ** d; }
 
-function round(n, decimals = 5) {
-  return Math.round(n * 10 ** decimals) / 10 ** decimals;
+function candlesAfter(candles, refCandle) {
+  if (!refCandle || !refCandle.datetime) return [];
+  return candles.filter(c => new Date(c.datetime) > new Date(refCandle.datetime));
 }
 
 module.exports = {
-  detectBias,
-  checkInvalidation,
-  calculateZones,
-  getPriceZone,
-  checkRecalculation,
-  calculateStopLoss,
-  calculateTargets,
+  detectBias, checkInvalidation, calculateZones,
+  checkRecalculation, getPriceZone, calculateSL,
+  calculateTargets, candlesAfter,
 };

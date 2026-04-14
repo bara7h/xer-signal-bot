@@ -1,10 +1,12 @@
 // ─────────────────────────────────────────────────────────────────────────────
-// XERO EDGE — Telegram Bot
-// Handles all user commands, signal delivery, and full analysis explanation
+// XERO EDGE v2 — Telegram Bot
+// Full NLP + slash commands + signal/analysis output
 // ─────────────────────────────────────────────────────────────────────────────
 
 const TelegramBot = require("node-telegram-bot-api");
-const scanner = require("../scanner/scanner");
+const scanner     = require("../scanner/scanner");
+const { parseIntent } = require("../nlp/nlpEngine");
+const { formatBiasOnly, formatSignal, formatAnalysis, formatScanSummary, formatNoSignal } = require("../output/formatter");
 const { DEFAULT_WATCHLIST } = require("../../config/markets");
 const logger = require("../utils/logger");
 
@@ -13,432 +15,445 @@ const ADMIN_ID = parseInt(process.env.ADMIN_CHAT_ID || "716635266");
 
 let bot = null;
 const authorizedChats = new Set([ADMIN_ID]);
+// Per-chat output mode override (inherits global if not set)
+const chatOutputMode = new Map();
 
-// ─── Init ─────────────────────────────────────────────────────────────────────
+// ── Init ──────────────────────────────────────────────────────────────────────
 
 function initBot() {
   if (!TOKEN || TOKEN === "YOUR_BOT_TOKEN_HERE") {
-    logger.warn("TELEGRAM_BOT_TOKEN not set — signals will log to console only");
+    logger.warn("No TELEGRAM_BOT_TOKEN — signals log to console only");
     return null;
   }
   bot = new TelegramBot(TOKEN, { polling: true });
-  logger.info("Telegram bot initialized — polling active");
+  logger.info("Bot online — polling active");
 
-  bot.onText(/\/start/, handleStart);
-  bot.onText(/\/help/, handleHelp);
-  bot.onText(/\/mode (.+)/, handleMode);
-  bot.onText(/\/mode$/, handleModeStatus);
-  bot.onText(/\/scan (.+)/, handleScan);
-  bot.onText(/\/scan$/, handleScanAll);
-  bot.onText(/\/watchlist$/, handleWatchlist);
-  bot.onText(/\/add (.+)/, handleAdd);
-  bot.onText(/\/remove (.+)/, handleRemove);
-  bot.onText(/\/signals$/, handleSignals);
-  bot.onText(/\/status$/, handleStatus);
-  bot.onText(/\/subscribe$/, handleSubscribe);
-  bot.onText(/\/stop$/, handleStop);
-  bot.on("polling_error", err => logger.error(`Polling error: ${err.message}`));
+  // Slash commands (explicit)
+  bot.onText(/\/start$/,        msg => handleStart(msg));
+  bot.onText(/\/help$/,         msg => handleHelp(msg));
+  bot.onText(/\/status$/,       msg => handleStatus(msg));
+  bot.onText(/\/signals$/,      msg => handleActiveSignals(msg));
+  bot.onText(/\/watchlist$/,    msg => handleWatchlist(msg));
+  bot.onText(/\/subscribe$/,    msg => handleSubscribe(msg));
+  bot.onText(/\/unsubscribe$/,  msg => handleUnsubscribe(msg));
+
+  // Slash shortcut commands (NLP-assisted)
+  bot.onText(/\/scan(.*)$/,     (msg, m) => handleSlashScan(msg, m[1].trim()));
+  bot.onText(/\/bias(.*)$/,     (msg, m) => handleSlashBias(msg, m[1].trim()));
+  bot.onText(/\/output (.+)$/,  (msg, m) => handleOutputSet(msg, m[1].trim()));
+  bot.onText(/\/mode (.+)$/,    (msg, m) => handleModeSet(msg, m[1].trim()));
+  bot.onText(/\/add (.+)$/,     (msg, m) => handleAdd(msg, m[1].trim()));
+  bot.onText(/\/remove (.+)$/,  (msg, m) => handleRemove(msg, m[1].trim()));
+
+  // ALL other messages → NLP
+  bot.on("message", msg => {
+    if (!msg.text || msg.text.startsWith("/")) return;
+    handleNLP(msg);
+  });
+
+  bot.on("polling_error", e => logger.error(`Polling: ${e.message}`));
   return bot;
 }
 
-// ─── Signal Delivery ─────────────────────────────────────────────────────────
+// ── Signal delivery ───────────────────────────────────────────────────────────
 
-async function sendSignal(signal) {
-  const [part1, part2] = buildSignalParts(signal);
+async function deliverSignal(signal, chatId, overrideMode) {
+  const mode = overrideMode || chatOutputMode.get(chatId) || scanner.getOutputMode();
+  const p1   = formatSignal(signal);
+  const p2   = mode === "analysis" ? formatAnalysis(signal) : null;
 
+  await safeSend(chatId, p1);
+  if (p2) { await sleep(400); await safeSend(chatId, p2); }
+}
+
+// Auto-delivery to all subscribers
+async function broadcastSignal(signal) {
   if (!bot) {
-    logger.info("\n" + "═".repeat(54) + "\n" + part1 + "\n\n" + part2 + "\n" + "═".repeat(54));
+    logger.info(`\n${"═".repeat(50)}\n${formatSignal(signal)}\n${"═".repeat(50)}`);
+    return;
+  }
+  for (const chatId of authorizedChats) {
+    await deliverSignal(signal, chatId);
+  }
+}
+
+// ── NLP message handler ───────────────────────────────────────────────────────
+
+async function handleNLP(msg) {
+  const chatId = msg.chat.id;
+  const text   = msg.text;
+  if (!text) return;
+
+  logger.debug(`NLP message from ${chatId}: "${text}"`);
+
+  let intent;
+  try {
+    intent = await parseIntent(text);
+  } catch(e) {
+    logger.error(`NLP parse error: ${e.message}`);
+    intent = { intent: "unknown", raw: text };
+  }
+
+  switch(intent.intent) {
+
+    case "greeting":
+      await safeSend(chatId, [
+        `👋 Hey! I'm XERO EDGE™.`,
+        ``,
+        `Tell me what you need — just type naturally:`,
+        `_"scan gold"_ · _"bias on EURUSD"_ · _"scan majors with analysis"_`,
+        `_"what's the bias on cable?"_ · _"show me active signals"_`,
+        ``,
+        `Or type /help for all commands.`,
+      ].join("\n"));
+      break;
+
+    case "help":
+      await handleHelp(msg);
+      break;
+
+    case "status":
+      await handleStatus(msg);
+      break;
+
+    case "active_signals":
+      await handleActiveSignals(msg);
+      break;
+
+    case "watchlist_view":
+      await handleWatchlist(msg);
+      break;
+
+    case "watchlist_add":
+      if (intent.symbols && intent.symbols.length) {
+        await addSymbols(chatId, intent.symbols);
+      } else {
+        await safeSend(chatId, "Which symbol do you want to add?");
+      }
+      break;
+
+    case "watchlist_remove":
+      if (intent.symbols && intent.symbols.length) {
+        await removeSymbols(chatId, intent.symbols);
+      } else {
+        await safeSend(chatId, "Which symbol do you want to remove?");
+      }
+      break;
+
+    case "set_output":
+      await setOutput(chatId, intent.mode);
+      break;
+
+    case "set_mode":
+      await setMode(chatId, intent.mode);
+      break;
+
+    case "bias_only": {
+      const instruments = scanner.resolveInstruments(intent);
+      if (!instruments.length) { await safeSend(chatId, "No instruments found for that."); break; }
+      await safeSend(chatId, `🔍 Scanning bias on ${instruments.length} instrument${instruments.length!==1?"s":""}...`);
+      const biasResults = await scanner.scanBiasOnly(instruments);
+      for (const { symbol, biasMap, error } of biasResults) {
+        if (error) { await safeSend(chatId, `❌ ${symbol}: ${error}`); continue; }
+        await safeSend(chatId, formatBiasOnly(symbol, biasMap));
+        await sleep(200);
+      }
+      break;
+    }
+
+    case "scan": {
+      const instruments = scanner.resolveInstruments(intent);
+      if (!instruments.length) { await safeSend(chatId, "No instruments found for that."); break; }
+      const mode = intent.outputMode || chatOutputMode.get(chatId) || scanner.getOutputMode();
+      await runScanAndDeliver(chatId, instruments, mode);
+      break;
+    }
+
+    default:
+      await safeSend(chatId, [
+        `I didn't quite get that. Try something like:`,
+        ``,
+        `_"scan gold"_ · _"bias on EURUSD"_ · _"scan majors with analysis"_`,
+        `_"show signals"_ · _"add GBPJPY to my list"_`,
+        ``,
+        `Or type /help for all commands.`,
+      ].join("\n"));
+  }
+}
+
+// ── Scan & deliver ────────────────────────────────────────────────────────────
+
+async function runScanAndDeliver(chatId, instruments, outputMode) {
+  const count = instruments.length;
+  await safeSend(chatId, `🔍 Scanning ${count} instrument${count!==1?"s":""}...`);
+
+  const results = await scanner.scanInstruments(instruments);
+
+  // Summary first
+  await safeSend(chatId, formatScanSummary(results, outputMode));
+  await sleep(300);
+
+  // Then signals or no-signal explanations
+  let signalCount = 0;
+  for (const { symbol, result } of results) {
+    if (!result.signals || result.signals.length === 0) {
+      if (count <= 3) {
+        // Only show no-signal detail for small scans
+        await safeSend(chatId, formatNoSignal(symbol, result));
+        await sleep(200);
+      }
+      continue;
+    }
+    for (const signal of result.signals) {
+      await deliverSignal(signal, chatId, outputMode);
+      await sleep(500);
+      signalCount++;
+    }
+  }
+
+  if (signalCount === 0 && count > 3) {
+    await safeSend(chatId, `_No full setups found across ${count} instruments. Market not aligned yet._`);
+  }
+}
+
+// ── Slash command handlers ────────────────────────────────────────────────────
+
+async function handleSlashScan(msg, args) {
+  const chatId = msg.chat.id;
+  const mode   = chatOutputMode.get(chatId) || scanner.getOutputMode();
+
+  if (!args) {
+    // Full watchlist scan
+    await runScanAndDeliver(chatId, scanner.getWatchlist(), mode);
     return;
   }
 
-  for (const chatId of authorizedChats) {
-    try { await bot.sendMessage(chatId, part1, { parse_mode: "Markdown", disable_web_page_preview: true }); } catch (e) { logger.error(`Send p1 to ${chatId}: ${e.message}`); }
-    await sleep(400);
-    try { await bot.sendMessage(chatId, part2, { parse_mode: "Markdown", disable_web_page_preview: true }); } catch (e) { logger.error(`Send p2 to ${chatId}: ${e.message}`); }
-  }
-  logger.info(`Signal delivered: ${signal.symbol} ${signal.bias} ${signal.mode}`);
+  // Parse args as NLP
+  const intent = await parseIntent(args || "scan all");
+  const instruments = scanner.resolveInstruments(intent);
+  if (!instruments.length) { await safeSend(chatId, `❌ Couldn't find "${args}" on the watchlist.`); return; }
+  await runScanAndDeliver(chatId, instruments, mode);
 }
 
-// ─── Signal Formatter ─────────────────────────────────────────────────────────
+async function handleSlashBias(msg, args) {
+  const chatId = msg.chat.id;
+  let instruments;
 
-function buildSignalParts(signal) {
-  const fmt    = priceFormatter(signal.symbol);
-  const isBull = signal.bias === "BULLISH";
-  const biasEmoji = isBull ? "🟢" : "🔴";
-  const modeEmoji = signal.mode === "2-Step" ? "⚡" : "🎯";
-  const recalc    = signal.htfZones && signal.htfZones.recalculated ? " _(recalculated)_" : "";
-  const tfLabel   = signal.mode === "3-Step"
-    ? `${signal.htf.toUpperCase()} → ${signal.mtf.toUpperCase()} → ${signal.ltf.toUpperCase()}`
-    : `${signal.htf.toUpperCase()} → ${signal.ltf.toUpperCase()}`;
-
-  const risk   = Math.abs(signal.entry - signal.sl);
-  const reward = Math.abs(signal.tp2 - signal.entry);
-  const rr     = risk > 0 ? (reward / risk).toFixed(1) : "N/A";
-
-  // Part 1: Trade levels
-  const part1 = [
-    "🔷 *XERO EDGE™ SIGNAL*",
-    "━━━━━━━━━━━━━━━━━━━━━━",
-    "",
-    `${modeEmoji} *Pair:* \`${signal.symbol}\``,
-    `📐 *Mode:* ${signal.mode}`,
-    `${biasEmoji} *Bias:* ${signal.bias}`,
-    `⏱ *Timeframes:* ${tfLabel}`,
-    "",
-    "━━━━━━━━━━━━━━━━━━━━━━",
-    "📊 *TRADE LEVELS*",
-    "",
-    `📍 *Entry:*     \`${fmt(signal.entry)}\``,
-    `🛑 *Stop Loss:* \`${fmt(signal.sl)}\``,
-    `🎯 *TP1 (1RR):* \`${fmt(signal.tp1)}\``,
-    `🚀 *TP2 (2RR):* \`${fmt(signal.tp2)}\``,
-    "",
-    `📦 *Zone:* ${signal.zone}${recalc}`,
-    `📐 *R:R at TP2:* 1 : ${rr}`,
-    "",
-    "━━━━━━━━━━━━━━━━━━━━━━",
-    `🟢 *Status:* ${signal.status}`,
-    `🕐 *Time:* ${formatTime(signal.timestamp)}`,
-    "━━━━━━━━━━━━━━━━━━━━━━",
-    "_XERO TRADERS HUB — Trade With Edge™_",
-  ].join("\n");
-
-  // Part 2: Full analysis
-  const part2 = buildAnalysis(signal, fmt);
-
-  return [part1, part2];
-}
-
-function buildAnalysis(signal, fmt) {
-  const isBull = signal.bias === "BULLISH";
-  const slRef  = signal.mode === "3-Step" ? "MTF" : "HTF";
-  const L = []; // lines array
-
-  L.push("🧠 *ANALYSIS — How this signal was built*");
-  L.push("━━━━━━━━━━━━━━━━━━━━━━");
-  L.push("");
-
-  // ── Step 1: HTF Bias ──────────────────────────────────────────────────────
-  L.push(`*📌 Step 1 — ${signal.htf.toUpperCase()} Bias (XERO EDGE™ C1/C2 Rule)*`);
-
-  if (signal.htfBias && signal.htfBias.C1 && signal.htfBias.C2) {
-    const { C1, C2 } = signal.htfBias;
-    L.push(`Last 2 closed candles on ${signal.htf.toUpperCase()}:`);
-    L.push(`C1: H \`${fmt(C1.high)}\`  L \`${fmt(C1.low)}\`  Close \`${fmt(C1.close)}\``);
-    L.push(`C2: H \`${fmt(C2.high)}\`  L \`${fmt(C2.low)}\`  Close \`${fmt(C2.close)}\``);
-    L.push("");
-    if (isBull) {
-      L.push("Bias conditions checked:");
-      L.push(`✅ C2 low \`${fmt(C2.low)}\` < C1 low \`${fmt(C1.low)}\` — C2 swept below C1`);
-      L.push(`✅ C2 high \`${fmt(C2.high)}\` < C1 high \`${fmt(C1.high)}\` — no structure break above`);
-      L.push(`✅ C2 close \`${fmt(C2.close)}\` < C1 high \`${fmt(C1.high)}\` — closed inside C1 range`);
-      L.push("→ *BULLISH BIAS* 🟢 — C2 grabbed liquidity below C1 low then closed back inside. Market shows intent to move UP.");
-    } else {
-      L.push("Bias conditions checked:");
-      L.push(`✅ C2 high \`${fmt(C2.high)}\` > C1 high \`${fmt(C1.high)}\` — C2 swept above C1`);
-      L.push(`✅ C2 low \`${fmt(C2.low)}\` > C1 low \`${fmt(C1.low)}\` — no structure break below`);
-      L.push(`✅ C2 close \`${fmt(C2.close)}\` > C1 low \`${fmt(C1.low)}\` — closed inside C1 range`);
-      L.push("→ *BEARISH BIAS* 🔴 — C2 grabbed liquidity above C1 high then closed back inside. Market shows intent to move DOWN.");
-    }
+  if (!args) {
+    instruments = scanner.getWatchlist();
   } else {
-    L.push(`${signal.bias} bias confirmed on ${signal.htf.toUpperCase()}.`);
+    const intent = await parseIntent(args);
+    instruments = scanner.resolveInstruments(intent);
   }
 
-  L.push("");
+  if (!instruments.length) { await safeSend(chatId, "No instruments found."); return; }
+  await safeSend(chatId, `🔍 Bias scan on ${instruments.length} instrument${instruments.length!==1?"s":""}...`);
 
-  // ── Step 2: HTF Zones ────────────────────────────────────────────────────
-  L.push(`*📌 Step 2 — ${signal.htf.toUpperCase()} Entry Zones (Fibonacci on C2)*`);
-
-  if (signal.htfZones) {
-    const z = signal.htfZones;
-    const range = (z.C2High - z.C2Low);
-    L.push(`C2 range: \`${fmt(z.C2Low)}\` → \`${fmt(z.C2High)}\`  (range = \`${fmt(range)}\`)`);
-    L.push("");
-    if (isBull) {
-      L.push("Fib levels measured from C2 low upward:");
-      L.push(`Zone 1 (0.618–0.768 retrace): \`${fmt(z.zone1.low)}\` – \`${fmt(z.zone1.high)}\``);
-      L.push(`Zone 2 (deep discount below 0.618): \`${fmt(z.zone2.low)}\` – \`${fmt(z.zone2.high)}\``);
-      L.push("→ Waiting for price to pull back DOWN into zones before buying.");
-    } else {
-      L.push("Fib levels measured from C2 high downward:");
-      L.push(`Zone 1 (0.618–0.768 retrace from top): \`${fmt(z.zone1.low)}\` – \`${fmt(z.zone1.high)}\``);
-      L.push(`Zone 2 (deep premium above 0.618): \`${fmt(z.zone2.low)}\` – \`${fmt(z.zone2.high)}\``);
-      L.push("→ Waiting for price to pull back UP into zones before selling.");
-    }
-    if (z.recalculated) {
-      L.push("");
-      L.push("⚠️ _Zones recalculated: price extended past C2 extreme but stayed inside C1 — new zones drawn from updated swing point._");
-    }
-    L.push("");
-    L.push(`✅ Price tapped *${signal.zone}* — entry condition met`);
+  const results = await scanner.scanBiasOnly(instruments);
+  for (const { symbol, biasMap, error } of results) {
+    if (error) { await safeSend(chatId, `❌ ${symbol}: ${error}`); continue; }
+    await safeSend(chatId, formatBiasOnly(symbol, biasMap));
+    await sleep(150);
   }
-
-  L.push("");
-
-  // ── Step 3: MTF (3-step only) ─────────────────────────────────────────────
-  if (signal.mode === "3-Step" && signal.mtfBias) {
-    L.push(`*📌 Step 3 — ${signal.mtf.toUpperCase()} Confirmation (must match HTF)*`);
-
-    if (signal.mtfBias.C1 && signal.mtfBias.C2) {
-      const { C1, C2 } = signal.mtfBias;
-      L.push(`C1: H \`${fmt(C1.high)}\`  L \`${fmt(C1.low)}\`  Close \`${fmt(C1.close)}\``);
-      L.push(`C2: H \`${fmt(C2.high)}\`  L \`${fmt(C2.low)}\`  Close \`${fmt(C2.close)}\``);
-      L.push("");
-      if (isBull) {
-        L.push("✅ C2 low < C1 low  ✅ C2 high < C1 high  ✅ C2 close < C1 high");
-        L.push("→ MTF is BULLISH — fractal alignment confirmed ✅");
-      } else {
-        L.push("✅ C2 high > C1 high  ✅ C2 low > C1 low  ✅ C2 close > C1 low");
-        L.push("→ MTF is BEARISH — fractal alignment confirmed ✅");
-      }
-    } else {
-      L.push(`${signal.bias} bias confirmed on ${signal.mtf.toUpperCase()} ✅`);
-    }
-
-    if (signal.mtfZones) {
-      const mz = signal.mtfZones;
-      L.push("");
-      L.push(`MTF Zone 1: \`${fmt(mz.zone1.low)}\` – \`${fmt(mz.zone1.high)}\``);
-      L.push(`MTF Zone 2: \`${fmt(mz.zone2.low)}\` – \`${fmt(mz.zone2.high)}\``);
-      L.push(`SL placed beyond MTF Zone 2 ${isBull ? "low" : "high"}: \`${fmt(signal.sl)}\``);
-    }
-
-    L.push("");
-  }
-
-  // ── Step 4: LTF Entry ────────────────────────────────────────────────────
-  const ltfStep = signal.mode === "3-Step" ? "4" : "3";
-  L.push(`*📌 Step ${ltfStep} — ${signal.ltf.toUpperCase()} Entry Trigger (final confirmation)*`);
-
-  if (signal.ltfBias && signal.ltfBias.C1 && signal.ltfBias.C2) {
-    const { C1, C2 } = signal.ltfBias;
-    L.push(`C1: H \`${fmt(C1.high)}\`  L \`${fmt(C1.low)}\`  Close \`${fmt(C1.close)}\``);
-    L.push(`C2: H \`${fmt(C2.high)}\`  L \`${fmt(C2.low)}\`  Close \`${fmt(C2.close)}\``);
-    L.push("");
-    if (isBull) {
-      L.push("✅ C2 low < C1 low  ✅ C2 high < C1 high  ✅ C2 close < C1 high");
-      L.push("→ LTF confirms BULLISH — all timeframes aligned, signal triggered ✅");
-    } else {
-      L.push("✅ C2 high > C1 high  ✅ C2 low > C1 low  ✅ C2 close > C1 low");
-      L.push("→ LTF confirms BEARISH — all timeframes aligned, signal triggered ✅");
-    }
-  } else {
-    L.push(`${signal.bias} bias confirmed on ${signal.ltf.toUpperCase()} ✅`);
-  }
-
-  if (signal.ltfZones) {
-    const lz = signal.ltfZones;
-    L.push("");
-    L.push(`LTF Zone 1: \`${fmt(lz.zone1.low)}\` – \`${fmt(lz.zone1.high)}\``);
-    L.push(`Entry = midpoint of LTF Zone 1 = \`${fmt(signal.entry)}\``);
-  }
-
-  L.push("");
-
-  // ── Risk/Reward Summary ───────────────────────────────────────────────────
-  L.push("*📌 Risk Management*");
-  const risk      = Math.abs(signal.entry - signal.sl);
-  const rewardTP1 = Math.abs(signal.tp1 - signal.entry);
-  const rewardTP2 = Math.abs(signal.tp2 - signal.entry);
-  L.push(`SL beyond ${slRef} Zone 2 ${isBull ? "low (below discount zone)" : "high (above premium zone)"}`);
-  L.push(`Risk = \`${fmt(risk)}\` pts`);
-  L.push(`TP1 @ 1:1 RR → \`${fmt(signal.tp1)}\`  (reward: \`${fmt(rewardTP1)}\`)`);
-  L.push(`TP2 @ 2:1 RR → \`${fmt(signal.tp2)}\`  (reward: \`${fmt(rewardTP2)}\`)`);
-  L.push("Remaining position → hold for momentum beyond TP2");
-  L.push("");
-  L.push("━━━━━━━━━━━━━━━━━━━━━━");
-  L.push("_Risk only what you can afford to lose._");
-
-  return L.join("\n");
 }
 
-// ─── Command Handlers ─────────────────────────────────────────────────────────
+async function handleOutputSet(msg, arg) {
+  const chatId = msg.chat.id;
+  const m = arg.toLowerCase().replace(/[^a-z]/g,"");
+  if (m === "signal" || m === "analysis") {
+    await setOutput(chatId, m);
+  } else {
+    await safeSend(chatId, "Use: /output signal  or  /output analysis");
+  }
+}
+
+async function handleModeSet(msg, arg) {
+  const chatId = msg.chat.id;
+  await setMode(chatId, arg.toLowerCase().replace(/[^a-z0-9]/g,""));
+}
+
+async function handleAdd(msg, arg) {
+  const { resolveSymbols } = require("../nlp/nlpEngine");
+  const syms = resolveSymbols(arg.toLowerCase());
+  if (!syms.length) { await safeSend(msg.chat.id, `❌ Couldn't find "${arg}" as a valid symbol.`); return; }
+  await addSymbols(msg.chat.id, syms);
+}
+
+async function handleRemove(msg, arg) {
+  const { resolveSymbols } = require("../nlp/nlpEngine");
+  const syms = resolveSymbols(arg.toLowerCase());
+  if (!syms.length) { await safeSend(msg.chat.id, `❌ Couldn't find "${arg}" as a valid symbol.`); return; }
+  await removeSymbols(msg.chat.id, syms);
+}
 
 async function handleStart(msg) {
   const name = msg.from.first_name || "Trader";
   await safeSend(msg.chat.id, [
-    "🔷 *XERO EDGE™ Signal Bot*",
-    "━━━━━━━━━━━━━━━━━━━━━━",
-    "",
-    `Welcome, *${name}*!`,
-    "",
-    "I scan markets 24/7 using the *XERO EDGE Fractal Liquidity Model* and send only high-probability setups — with full step-by-step analysis on every signal.",
-    "",
-    `🎯 *Mode:* ${scanner.getMode() === "3step" ? "3-Step (HTF→MTF→LTF)" : "2-Step (HTF→LTF)"}`,
-    `📊 *Instruments:* ${scanner.getWatchlist().length} on watchlist`,
-    "",
-    "Type /help for all commands.",
-    "",
-    "_XERO TRADERS HUB — Trade With Edge™_",
+    `🔷 *XERO EDGE™ Signal Bot v2*`,
+    `━━━━━━━━━━━━━━━━━━━━━━`,
+    ``,
+    `Welcome, *${name}*! 👋`,
+    ``,
+    `I use the *XERO EDGE Fractal Liquidity Model* to scan markets and find high-probability setups across multiple timeframes.`,
+    ``,
+    `You can talk to me in *plain English*:`,
+    `_"scan gold"_  ·  _"what's the bias on EURUSD?"_`,
+    `_"scan majors with full analysis"_  ·  _"show me active signals"_`,
+    ``,
+    `Or use slash commands — type /help to see all of them.`,
+    ``,
+    `📊 *Watching:* ${scanner.getWatchlist().length} instruments`,
+    `⚙️ *Mode:* ${scanner.getFractalMode() === "3step" ? "3-Step Fractal" : "2-Step Fractal"}`,
+    `📤 *Output:* ${scanner.getOutputMode() === "analysis" ? "Full Analysis" : "Signal Only"}`,
+    ``,
+    `_XERO TRADERS HUB — Trade With Edge™_`,
   ].join("\n"));
 }
 
 async function handleHelp(msg) {
   await safeSend(msg.chat.id, [
-    "🔷 *XERO EDGE™ Bot — Commands*",
-    "━━━━━━━━━━━━━━━━━━━━━━",
-    "",
-    "📡 *Scanning*",
-    "/scan — Full watchlist scan now",
-    "/scan XAUUSD — Scan specific symbol",
-    "/signals — All active signals",
-    "",
-    "⚙️ *Mode*",
-    "/mode 3step — HTF→MTF→LTF (more confirmation)",
-    "/mode 2step — HTF→LTF (faster execution)",
-    "/mode — Show current mode",
-    "",
-    "📋 *Watchlist*",
-    "/watchlist — View all instruments",
-    "/add SYMBOL — Add to watchlist",
-    "/remove SYMBOL — Remove from watchlist",
-    "",
-    "🔔 *Alerts*",
-    "/subscribe — Receive signals here",
-    "/stop — Stop receiving signals",
-    "/status — Bot stats",
-    "",
-    "━━━━━━━━━━━━━━━━━━━━━━",
-    "_No alignment = No signal. Discipline is the edge._",
+    `🔷 *XERO EDGE™ — Commands*`,
+    `━━━━━━━━━━━━━━━━━━━━━━`,
+    ``,
+    `💬 *Just type naturally — examples:*`,
+    `_"scan gold"_`,
+    `_"what's the bias on cable?"_`,
+    `_"scan majors with analysis"_`,
+    `_"check EURUSD and GBPUSD"_`,
+    `_"bias scan on all"_`,
+    `_"add GBPJPY to my watchlist"_`,
+    ``,
+    `━━━━━━━━━━━━━━━━━━━━━━`,
+    `📡 *Scanning*`,
+    `/scan — Full watchlist scan`,
+    `/scan XAUUSD — Scan one instrument`,
+    `/scan majors — Scan a category`,
+    `/bias — Bias map (all TFs, no entry)`,
+    `/bias EURUSD — Bias for one instrument`,
+    `/signals — Show active signals`,
+    ``,
+    `⚙️ *Settings*`,
+    `/output signal — Clean signal only`,
+    `/output analysis — Full step-by-step`,
+    `/mode 3step — HTF→MTF→LTF`,
+    `/mode 2step — HTF→LTF (faster)`,
+    `/watchlist — Show tracked instruments`,
+    `/add SYMBOL — Add to watchlist`,
+    `/remove SYMBOL — Remove from watchlist`,
+    ``,
+    `🔔 *Alerts*`,
+    `/subscribe — Get auto-signals here`,
+    `/unsubscribe — Stop signals`,
+    `/status — Bot stats`,
+    `━━━━━━━━━━━━━━━━━━━━━━`,
+    `_No alignment = No signal. Discipline is the edge._`,
   ].join("\n"));
 }
 
-async function handleMode(msg, match) {
-  if (!isAuthorized(msg.chat.id)) { await safeSend(msg.chat.id, "⛔ Admin only."); return; }
-  const mode = match[1].trim().toLowerCase().replace(/[-_]/g, "");
-  try {
-    scanner.setMode(mode);
-    const label = mode === "3step" ? "3-Step Fractal (HTF → MTF → LTF)" : "2-Step Fractal (HTF → LTF)";
-    await safeSend(msg.chat.id, `✅ *Mode switched to:* ${label}\n\n_Next scan uses the new mode._`);
-  } catch {
-    await safeSend(msg.chat.id, "❌ Use: /mode 3step  or  /mode 2step");
-  }
-}
-
-async function handleModeStatus(msg) {
-  const mode = scanner.getMode();
-  const label = mode === "3step"
-    ? "🎯 3-Step Fractal (HTF → MTF → LTF)\n_Higher confirmation, lower frequency_"
-    : "⚡ 2-Step Fractal (HTF → LTF)\n_Faster execution, higher frequency_";
-  await safeSend(msg.chat.id, `*Current Mode:*\n${label}`);
-}
-
-async function handleScan(msg, match) {
-  const symbol = match[1].trim().toUpperCase();
-  await safeSend(msg.chat.id, `🔍 Scanning *${symbol}*...`);
-  const results = await scanner.scanSymbol(symbol);
-  if (results && results.error) { await safeSend(msg.chat.id, `❌ ${results.error}`); return; }
-  if (!results || results.length === 0) {
-    await safeSend(msg.chat.id, `📭 *No signal for ${symbol}*\n\nBias alignment incomplete — no trade. Wait for the setup.`);
-    return;
-  }
-  for (const signal of results) await sendSignal(signal);
-}
-
-async function handleScanAll(msg) {
-  if (!isAuthorized(msg.chat.id)) { await safeSend(msg.chat.id, "⛔ Admin only."); return; }
-  await safeSend(msg.chat.id, `🔍 Scanning ${scanner.getWatchlist().length} instruments...`);
-  await scanner.runScanCycle();
-  await safeSend(msg.chat.id, `✅ Scan complete. Active signals: ${scanner.getActiveSignals().length}`);
-}
-
-async function handleWatchlist(msg) {
-  const wl = scanner.getWatchlist();
-  if (wl.length === 0) { await safeSend(msg.chat.id, "📋 Watchlist empty. Use /add SYMBOL."); return; }
-  const grouped = {};
-  for (const inst of wl) {
-    if (!grouped[inst.category]) grouped[inst.category] = [];
-    grouped[inst.category].push(inst.displayName);
-  }
-  let text = "📋 *Watchlist*\n━━━━━━━━━━━━━━━━━━━━━━\n";
-  for (const [cat, syms] of Object.entries(grouped)) {
-    text += `\n*${cat}:*\n${syms.map(s => `• \`${s}\``).join("\n")}\n`;
-  }
-  text += `\n_Total: ${wl.length} instruments_`;
-  await safeSend(msg.chat.id, text);
-}
-
-async function handleAdd(msg, match) {
-  if (!isAuthorized(msg.chat.id)) { await safeSend(msg.chat.id, "⛔ Admin only."); return; }
-  const sym = match[1].trim().toUpperCase();
-  const wl  = scanner.getWatchlist();
-  if (wl.some(i => i.displayName === sym || i.symbol === sym)) {
-    await safeSend(msg.chat.id, `ℹ️ \`${sym}\` already on watchlist.`); return;
-  }
-  const def = DEFAULT_WATCHLIST.find(i => i.displayName === sym);
-  const inst = def || { symbol: sym.includes("/") ? sym : `${sym.slice(0,3)}/${sym.slice(3)}`, displayName: sym, category: "Custom" };
-  scanner.setWatchlist([...wl, inst]);
-  await safeSend(msg.chat.id, `✅ \`${sym}\` added.`);
-}
-
-async function handleRemove(msg, match) {
-  if (!isAuthorized(msg.chat.id)) { await safeSend(msg.chat.id, "⛔ Admin only."); return; }
-  const sym   = match[1].trim().toUpperCase();
-  const wl    = scanner.getWatchlist();
-  const newWl = wl.filter(i => i.displayName !== sym && i.symbol !== sym);
-  if (newWl.length === wl.length) { await safeSend(msg.chat.id, `❌ \`${sym}\` not found.`); return; }
-  scanner.setWatchlist(newWl);
-  await safeSend(msg.chat.id, `✅ \`${sym}\` removed.`);
-}
-
-async function handleSignals(msg) {
-  const signals = scanner.getActiveSignals();
-  if (signals.length === 0) {
-    await safeSend(msg.chat.id, "📭 *No active signals*\n\nMarket hasn't aligned. Wait for the edge."); return;
-  }
-  await safeSend(msg.chat.id, `📡 *${signals.length} Active Signal(s)*\n━━━━━━━━━━━━━━━━━━━━━━`);
-  for (const signal of signals) await sendSignal(signal);
-}
-
 async function handleStatus(msg) {
+  const wl = scanner.getWatchlist();
   await safeSend(msg.chat.id, [
-    "📊 *XERO EDGE™ Bot Status*",
-    "━━━━━━━━━━━━━━━━━━━━━━",
-    "",
-    "🟢 *Status:* Online",
-    `⚙️ *Mode:* ${scanner.getMode() === "3step" ? "3-Step Fractal" : "2-Step Fractal"}`,
-    `📡 *Data:* ${process.env.DATA_PROVIDER || "mock"}`,
-    `⏱ *Scan every:* ${process.env.SCAN_INTERVAL_SECONDS || "60"}s`,
-    `📋 *Watchlist:* ${scanner.getWatchlist().length} instruments`,
-    `🎯 *Active Signals:* ${scanner.getActiveSignals().length}`,
-    `👥 *Subscribed:* ${authorizedChats.size} chats`,
-    "",
+    `📊 *XERO EDGE™ Status*`,
+    `━━━━━━━━━━━━━━━━━━━━━━`,
+    `🟢 Online`,
+    `⚙️ Mode: ${scanner.getFractalMode() === "3step" ? "3-Step Fractal" : "2-Step Fractal"}`,
+    `📤 Output: ${scanner.getOutputMode() === "analysis" ? "Full Analysis" : "Signal Only"}`,
+    `📡 Data: ${process.env.DATA_PROVIDER || "mock"}`,
+    `⏱ Auto-scan: every ${process.env.SCAN_INTERVAL_SECONDS || "300"}s`,
+    `📋 Watchlist: ${wl.length} instruments`,
+    `🎯 Active signals: ${scanner.getActiveSignals().length}`,
+    `👥 Subscribers: ${authorizedChats.size}`,
     `_${new Date().toUTCString()}_`,
   ].join("\n"));
 }
 
+async function handleActiveSignals(msg) {
+  const signals = scanner.getActiveSignals();
+  if (!signals.length) {
+    await safeSend(msg.chat.id, `📭 *No active signals*\n\nMarket not aligned yet. Patience is the strategy.`);
+    return;
+  }
+  await safeSend(msg.chat.id, `📡 *${signals.length} active signal${signals.length!==1?"s":""}*`);
+  for (const signal of signals) {
+    await deliverSignal(signal, msg.chat.id);
+    await sleep(400);
+  }
+}
+
+async function handleWatchlist(msg) {
+  const wl = scanner.getWatchlist();
+  if (!wl.length) { await safeSend(msg.chat.id, "📋 Watchlist is empty."); return; }
+  const grouped = {};
+  for (const i of wl) {
+    if (!grouped[i.category]) grouped[i.category] = [];
+    grouped[i.category].push(i.displayName);
+  }
+  let text = `📋 *Watchlist* (${wl.length} instruments)\n━━━━━━━━━━━━━━━━━━━━━━\n`;
+  for (const [cat, syms] of Object.entries(grouped)) {
+    text += `\n*${cat.charAt(0).toUpperCase()+cat.slice(1)}:*\n${syms.map(s=>`• \`${s}\``).join("\n")}\n`;
+  }
+  await safeSend(msg.chat.id, text);
+}
+
 async function handleSubscribe(msg) {
   authorizedChats.add(msg.chat.id);
-  await safeSend(msg.chat.id, "✅ *Subscribed!*\n\nYou'll receive XERO EDGE™ signals here.\nUse /stop to unsubscribe.");
-  logger.info(`Chat ${msg.chat.id} subscribed`);
+  await safeSend(msg.chat.id, `✅ *Subscribed!*\nYou'll receive XERO EDGE™ signals automatically.\nUse /unsubscribe to stop.`);
 }
 
-async function handleStop(msg) {
+async function handleUnsubscribe(msg) {
   if (msg.chat.id === ADMIN_ID) { await safeSend(msg.chat.id, "⚠️ Admin cannot unsubscribe."); return; }
   authorizedChats.delete(msg.chat.id);
-  await safeSend(msg.chat.id, "🔕 Unsubscribed. Use /subscribe to re-enable.");
+  await safeSend(msg.chat.id, `🔕 Unsubscribed. Use /subscribe to re-enable.`);
 }
 
-// ─── Helpers ──────────────────────────────────────────────────────────────────
+// ── Shared helpers ────────────────────────────────────────────────────────────
+
+async function setOutput(chatId, mode) {
+  chatOutputMode.set(chatId, mode);
+  if (chatId === ADMIN_ID) scanner.setOutputMode(mode);
+  await safeSend(chatId, `✅ Output mode → *${mode === "analysis" ? "Full Analysis" : "Signal Only"}*`);
+}
+
+async function setMode(chatId, mode) {
+  const m = mode.replace(/[^a-z0-9]/g,"");
+  if (!["3step","2step"].includes(m)) { await safeSend(chatId, "Use: /mode 3step  or  /mode 2step"); return; }
+  scanner.setFractalMode(m);
+  await safeSend(chatId, `✅ Mode → *${m === "3step" ? "3-Step (HTF→MTF→LTF)" : "2-Step (HTF→LTF)"}*`);
+}
+
+async function addSymbols(chatId, syms) {
+  const wl = scanner.getWatchlist();
+  const added = [];
+  for (const sym of syms) {
+    if (wl.some(i=>i.displayName===sym)) continue;
+    const def = DEFAULT_WATCHLIST.find(i=>i.displayName===sym);
+    const inst = def || { symbol: sym.length>5?sym:`${sym.slice(0,3)}/${sym.slice(3)}`, displayName: sym, category:"custom" };
+    wl.push(inst);
+    added.push(sym);
+  }
+  scanner.setWatchlist(wl);
+  if (added.length) await safeSend(chatId, `✅ Added: ${added.map(s=>`\`${s}\``).join(", ")}`);
+  else await safeSend(chatId, `ℹ️ Already on watchlist.`);
+}
+
+async function removeSymbols(chatId, syms) {
+  const wl = scanner.getWatchlist();
+  const removed = [];
+  const newWl = wl.filter(i => {
+    if (syms.includes(i.displayName)) { removed.push(i.displayName); return false; }
+    return true;
+  });
+  scanner.setWatchlist(newWl);
+  if (removed.length) await safeSend(chatId, `✅ Removed: ${removed.map(s=>`\`${s}\``).join(", ")}`);
+  else await safeSend(chatId, `❌ Not found on watchlist.`);
+}
 
 async function safeSend(chatId, text) {
-  if (!bot) { logger.info(`[CONSOLE → ${chatId}]:\n${text}`); return; }
-  try { await bot.sendMessage(chatId, text, { parse_mode: "Markdown" }); }
-  catch (err) { logger.error(`safeSend error to ${chatId}: ${err.message}`); }
+  if (!bot) { logger.info(`[CONSOLE→${chatId}]\n${text}`); return; }
+  try { await bot.sendMessage(chatId, text, { parse_mode:"Markdown" }); }
+  catch(e) { logger.error(`safeSend ${chatId}: ${e.message}`); }
 }
 
-function isAuthorized(chatId) { return chatId === ADMIN_ID; }
+function sleep(ms) { return new Promise(r=>setTimeout(r,ms)); }
 
-function priceFormatter(symbol) {
-  const highPrecision = ["JPY","XAU","XAG","BTC","ETH","WTI","SPX","NAS","US30","DAX","SP5","GER"];
-  if (highPrecision.some(k => symbol.includes(k))) return n => Number(n).toFixed(2);
-  return n => Number(n).toFixed(5);
-}
-
-function formatTime(isoString) {
-  return new Date(isoString).toUTCString().replace(" GMT", " UTC");
-}
-
-function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
-
-module.exports = { initBot, sendSignal };
+module.exports = { initBot, broadcastSignal };

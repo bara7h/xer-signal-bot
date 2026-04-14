@@ -1,58 +1,25 @@
-// ─────────────────────────────────────────────────────────────────────────────
-// XERO EDGE™ SIGNAL BOT — Main Entry Point
-// Fractal Liquidity Model | XERO TRADERS HUB
-// ─────────────────────────────────────────────────────────────────────────────
-
 require("dotenv").config();
-
-const logger   = require("./utils/logger");
-const scanner  = require("./scanner/scanner");
-const { initBot, sendSignal } = require("./telegram/bot");
-const { DEFAULT_WATCHLIST }   = require("../config/markets");
-
-// ─── Boot Sequence ────────────────────────────────────────────────────────────
+const logger  = require("./utils/logger");
+const scanner = require("./scanner/scanner");
+const { initBot, broadcastSignal } = require("./telegram/bot");
 
 async function main() {
   logger.info("═══════════════════════════════════════════════════");
-  logger.info("  XERO EDGE™ SIGNAL BOT — Starting up");
+  logger.info("  XERO EDGE™ SIGNAL BOT v2 — Starting up");
   logger.info("  XERO TRADERS HUB | Pondicherry, India");
   logger.info("═══════════════════════════════════════════════════");
 
-  // 1. Initialize Telegram Bot
   initBot();
 
-  // 2. Load default watchlist
-  scanner.setWatchlist(DEFAULT_WATCHLIST);
+  scanner.onSignal(broadcastSignal);
 
-  // 3. Set default fractal mode
-  const mode = process.env.DEFAULT_MODE || "3step";
-  scanner.setMode(mode);
+  const ms = parseInt(process.env.SCAN_INTERVAL_SECONDS || "300") * 1000;
+  scanner.startScanning(ms);
 
-  // 4. Wire signal events to Telegram delivery
-  scanner.onSignal(async (signal) => {
-    await sendSignal(signal);
-  });
+  logger.info(`Bot LIVE | Mode: ${scanner.getFractalMode()} | Output: ${scanner.getOutputMode()} | Instruments: ${scanner.getWatchlist().length}`);
 
-  // 5. Start scanning loop
-  const intervalMs = parseInt(process.env.SCAN_INTERVAL_SECONDS || "60") * 1000;
-  scanner.startScanning(intervalMs);
-
-  logger.info(`Scanner running every ${intervalMs / 1000}s`);
-  logger.info(`Mode: ${mode} | Watchlist: ${DEFAULT_WATCHLIST.length} instruments`);
-  logger.info("Bot is LIVE. Waiting for fractal alignment...");
-
-  // Graceful shutdown
-  process.on("SIGINT",  shutdown);
-  process.on("SIGTERM", shutdown);
+  process.on("SIGINT",  () => { scanner.stopScanning(); process.exit(0); });
+  process.on("SIGTERM", () => { scanner.stopScanning(); process.exit(0); });
 }
 
-function shutdown() {
-  logger.info("Shutting down XERO EDGE™ Signal Bot...");
-  scanner.stopScanning();
-  process.exit(0);
-}
-
-main().catch(err => {
-  logger.error("Fatal startup error:", err);
-  process.exit(1);
-});
+main().catch(e => { console.error("Fatal:", e); process.exit(1); });

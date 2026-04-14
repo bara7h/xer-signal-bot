@@ -1,269 +1,114 @@
 // ─────────────────────────────────────────────────────────────────────────────
-// XERO EDGE — Market Scanner
-// Manages watchlist, scanning schedule, dedup, and signal lifecycle
+// XERO EDGE v2 — Scanner
 // ─────────────────────────────────────────────────────────────────────────────
 
-const { fetchCandles, fetchCurrentPrice } = require("./dataProvider");
-const { runThreeStepFractal, runTwoStepFractal } = require("../engine/fractalEngine");
-const { FRACTAL_STACKS, SCAN_INTERVALS } = require("../../config/markets");
+const { runFullScan, runBiasOnly } = require("../engine/fractalEngine");
+const { DEFAULT_WATCHLIST } = require("../../config/markets");
 const logger = require("../utils/logger");
 
-// ─── State ────────────────────────────────────────────────────────────────────
-
-/** Active watchlist — array of instrument objects */
-let watchlist = [];
-
-/** Current fractal mode */
-let currentMode = process.env.DEFAULT_MODE || "3step";
-
-/** Active signals map: key = `${symbol}_${stackId}`, value = signal object */
-const activeSignals = new Map();
-
-/** Cooldown map: prevent duplicate alerts for same setup + bias direction
- *  Key format: `${symbol}_${stackId}_${mode}_${bias}` 
- *  This means BULLISH and BEARISH on the same instrument fire independently
- */
+let watchlist    = [...DEFAULT_WATCHLIST];
+let outputMode   = process.env.DEFAULT_OUTPUT_MODE || "signal";
+let fractalMode  = process.env.DEFAULT_MODE || "3step";
+const activeSignals   = new Map();
 const signalCooldowns = new Map();
-const COOLDOWN_MS = 4 * 60 * 60 * 1000; // 4 hours per symbol/stack/bias
-
-/** Signal event listeners */
+const COOLDOWN_MS = 4 * 60 * 60 * 1000;
 const signalListeners = [];
+let scanTimer = null;
 
-// ─── Public API ───────────────────────────────────────────────────────────────
+function setWatchlist(list)  { watchlist = list; }
+function getWatchlist()      { return watchlist; }
+function setOutputMode(m)    { outputMode = m; logger.info(`Output mode → ${m}`); }
+function getOutputMode()     { return outputMode; }
+function setFractalMode(m)   { fractalMode = m; logger.info(`Fractal mode → ${m}`); }
+function getFractalMode()    { return fractalMode; }
+function onSignal(fn)        { signalListeners.push(fn); }
+function getActiveSignals()  { return Array.from(activeSignals.values()); }
 
-function setWatchlist(instruments) {
-  watchlist = instruments;
-  logger.info(`Watchlist updated: ${instruments.map(i => i.displayName).join(", ")}`);
-}
-
-function getWatchlist() {
+function resolveInstruments(intent) {
+  if (intent.symbols && intent.symbols.length)
+    return watchlist.filter(i => intent.symbols.includes(i.displayName));
+  if (intent.category && intent.category !== "all")
+    return watchlist.filter(i => i.category === intent.category);
   return watchlist;
 }
 
-function setMode(mode) {
-  if (!["3step", "2step"].includes(mode)) {
-    throw new Error(`Invalid mode: ${mode}. Use "3step" or "2step".`);
-  }
-  currentMode = mode;
-  logger.info(`Fractal mode set to: ${mode}`);
-}
-
-function getMode() {
-  return currentMode;
-}
-
-function onSignal(listener) {
-  signalListeners.push(listener);
-}
-
-function getActiveSignals() {
-  return Array.from(activeSignals.values());
-}
-
-// ─── Scan Loop ────────────────────────────────────────────────────────────────
-
-let scanInterval = null;
-
-function startScanning(intervalMs) {
-  const ms = intervalMs || parseInt(process.env.SCAN_INTERVAL_SECONDS || "60") * 1000;
-  logger.info(`Scanner started — interval: ${ms / 1000}s | mode: ${currentMode}`);
-
-  // Run immediately then on interval
-  runScanCycle();
-  scanInterval = setInterval(runScanCycle, ms);
-}
-
-function stopScanning() {
-  if (scanInterval) {
-    clearInterval(scanInterval);
-    scanInterval = null;
-    logger.info("Scanner stopped");
-  }
-}
-
-async function runScanCycle() {
-  if (watchlist.length === 0) {
-    logger.debug("Scan cycle skipped — watchlist empty");
-    return;
-  }
-
-  logger.debug(`--- Scan cycle START [${new Date().toISOString()}] mode=${currentMode} ---`);
-
-  const stacks = FRACTAL_STACKS[currentMode];
-  const tasks = [];
-
-  for (const instrument of watchlist) {
-    for (const stack of stacks) {
-      tasks.push(scanInstrumentStack(instrument, stack));
-    }
-  }
-
-  // Run all scans concurrently (but respect API rate limits via batching)
-  await runBatched(tasks, 5); // max 5 concurrent API calls
-
-  logger.debug(`--- Scan cycle END ---`);
-}
-
-/**
- * Scan a single instrument across a single fractal stack
- */
-async function scanInstrumentStack(instrument, stack) {
-  const { symbol, displayName } = instrument;
-  // Cooldown key includes bias direction — checked after signal is generated
-  // so BULLISH and BEARISH setups on same instrument can both fire independently
-  const signalKeyBase = `${symbol}_${stack.id}_${currentMode}`;
-
-  try {
-    // Fetch current price
-    const currentPrice = await fetchCurrentPrice(symbol);
-    if (!currentPrice) return;
-
-    let signal = null;
-
-    if (currentMode === "3step") {
-      // Fetch all three timeframes
-      const [htfCandles, mtfCandles, ltfCandles] = await Promise.all([
-        fetchCandles(symbol, stack.htf, 10),
-        fetchCandles(symbol, stack.mtf, 10),
-        fetchCandles(symbol, stack.ltf, 10),
-      ]);
-
-      if (!htfCandles || !mtfCandles || !ltfCandles) return;
-
-      signal = await runThreeStepFractal({
-        symbol: displayName,
-        stack,
-        htfCandles,
-        mtfCandles,
-        ltfCandles,
-        currentPrice,
-      });
-
-    } else {
-      // 2-step: HTF + LTF only
-      const [htfCandles, ltfCandles] = await Promise.all([
-        fetchCandles(symbol, stack.htf, 10),
-        fetchCandles(symbol, stack.ltf, 10),
-      ]);
-
-      if (!htfCandles || !ltfCandles) return;
-
-      signal = await runTwoStepFractal({
-        symbol: displayName,
-        stack,
-        htfCandles,
-        ltfCandles,
-        currentPrice,
-      });
-    }
-
-    if (signal) {
-      // Key includes bias — BULLISH and BEARISH tracked independently
-      const signalKey = `${signalKeyBase}_${signal.bias}`;
-
-      // Check cooldown AFTER we know the bias direction
-      if (isOnCooldown(signalKey)) {
-        logger.debug(`[${displayName}][${stack.id}][${signal.bias}] On cooldown — skipping`);
-        return;
-      }
-
-      // Store active signal
-      activeSignals.set(signalKey, signal);
-
-      // Set cooldown
-      setCooldown(signalKey);
-
-      // Notify all listeners (Telegram bot, etc.)
-      for (const listener of signalListeners) {
-        try {
-          await listener(signal);
-        } catch (err) {
-          logger.error(`Signal listener error: ${err.message}`);
-        }
-      }
-    }
-
-  } catch (err) {
-    logger.error(`scanInstrumentStack error [${displayName}][${stack.id}]: ${err.message}`);
-  }
-}
-
-// ─── Manual Scan (on-demand for specific symbol) ──────────────────────────────
-
-async function scanSymbol(symbolOrDisplay) {
-  const instrument = watchlist.find(
-    i => i.symbol === symbolOrDisplay || i.displayName === symbolOrDisplay
-  );
-
-  if (!instrument) {
-    return { error: `Symbol "${symbolOrDisplay}" not in watchlist` };
-  }
-
-  const stacks = FRACTAL_STACKS[currentMode];
+async function scanInstruments(instruments) {
   const results = [];
-
-  for (const stack of stacks) {
-    await scanInstrumentStack(instrument, stack);
-    // Check both bias directions in active signals
-    const keyBull = `${instrument.symbol}_${stack.id}_${currentMode}_BULLISH`;
-    const keyBear = `${instrument.symbol}_${stack.id}_${currentMode}_BEARISH`;
-    if (activeSignals.has(keyBull)) results.push(activeSignals.get(keyBull));
-    if (activeSignals.has(keyBear)) results.push(activeSignals.get(keyBear));
+  const batchSize = 3;
+  for (let i = 0; i < instruments.length; i += batchSize) {
+    const batch = instruments.slice(i, i + batchSize);
+    const batchResults = await Promise.all(batch.map(async inst => {
+      try {
+        const result = await runFullScan(inst.symbol);
+        for (const signal of (result.signals || [])) {
+          const key = `${signal.symbol}_${signal.htfTf}_${signal.bias}`;
+          if (!isOnCooldown(key)) {
+            activeSignals.set(key, signal);
+            setCooldown(key);
+            for (const fn of signalListeners) {
+              try { await fn(signal); } catch(e) { logger.error(`Listener: ${e.message}`); }
+            }
+          }
+        }
+        return { symbol: inst.displayName, result };
+      } catch(e) {
+        logger.error(`scan [${inst.displayName}]: ${e.message}`);
+        return { symbol: inst.displayName, result: { error: e.message, signals: [] } };
+      }
+    }));
+    results.push(...batchResults);
+    if (i + batchSize < instruments.length) await sleep(600);
   }
-
   return results;
 }
 
-// ─── Cooldown helpers ─────────────────────────────────────────────────────────
+async function scanBiasOnly(instruments) {
+  const results = [];
+  for (const inst of instruments) {
+    try {
+      const biasMap = await runBiasOnly(inst.symbol);
+      results.push({ symbol: inst.displayName, biasMap });
+    } catch(e) {
+      results.push({ symbol: inst.displayName, biasMap: null, error: e.message });
+    }
+  }
+  return results;
+}
+
+function startScanning(intervalMs) {
+  const ms = intervalMs || parseInt(process.env.SCAN_INTERVAL_SECONDS||"300") * 1000;
+  logger.info(`Auto-scan every ${ms/1000}s`);
+  runAutoScan();
+  scanTimer = setInterval(runAutoScan, ms);
+}
+
+function stopScanning() {
+  if (scanTimer) { clearInterval(scanTimer); scanTimer = null; }
+}
+
+async function runAutoScan() {
+  logger.debug(`Auto-scan: ${watchlist.length} instruments`);
+  await scanInstruments(watchlist);
+}
 
 function isOnCooldown(key) {
   const ts = signalCooldowns.get(key);
-  if (!ts) return false;
-  return Date.now() - ts < COOLDOWN_MS;
+  return ts && Date.now() - ts < COOLDOWN_MS;
 }
+function setCooldown(key) { signalCooldowns.set(key, Date.now()); }
 
-function setCooldown(key) {
-  signalCooldowns.set(key, Date.now());
-}
-
-// ─── Batch runner (avoid API hammering) ──────────────────────────────────────
-
-async function runBatched(tasks, batchSize) {
-  for (let i = 0; i < tasks.length; i += batchSize) {
-    const batch = tasks.slice(i, i + batchSize);
-    await Promise.all(batch);
-    if (i + batchSize < tasks.length) {
-      await sleep(500); // 500ms between batches
-    }
-  }
-}
-
-function sleep(ms) {
-  return new Promise(resolve => setTimeout(resolve, ms));
-}
-
-// ─── Signal expiry cleanup ────────────────────────────────────────────────────
-
-// Remove signals older than 24h from active map
 setInterval(() => {
-  const cutoff = Date.now() - 24 * 60 * 60 * 1000;
-  for (const [key, signal] of activeSignals.entries()) {
-    if (new Date(signal.timestamp).getTime() < cutoff) {
-      activeSignals.delete(key);
-      logger.debug(`Expired signal removed: ${key}`);
-    }
+  const cut = Date.now() - 24*60*60*1000;
+  for (const [k,s] of activeSignals.entries()) {
+    if (new Date(s.timestamp).getTime() < cut) activeSignals.delete(k);
   }
-}, 60 * 60 * 1000); // check every hour
+}, 3600000);
+
+function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
 module.exports = {
-  setWatchlist,
-  getWatchlist,
-  setMode,
-  getMode,
-  onSignal,
-  getActiveSignals,
-  startScanning,
-  stopScanning,
-  runScanCycle,
-  scanSymbol,
+  setWatchlist, getWatchlist, setOutputMode, getOutputMode,
+  setFractalMode, getFractalMode, onSignal, getActiveSignals,
+  resolveInstruments, scanInstruments, scanBiasOnly,
+  startScanning, stopScanning, runAutoScan,
 };

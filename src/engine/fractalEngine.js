@@ -1,244 +1,246 @@
 // ─────────────────────────────────────────────────────────────────────────────
-// XERO EDGE — Fractal Analysis Engine
-// Orchestrates multi-timeframe bias alignment and signal generation
+// XERO EDGE v2 — Fractal Engine
+// Orchestrates all fractal stacks. Each HTF bias spawns its own stack.
+// MTF: check higher-priority TF first (4H > 1H), take first with same bias.
 // ─────────────────────────────────────────────────────────────────────────────
 
 const {
-  detectBias,
-  checkInvalidation,
-  calculateZones,
-  getPriceZone,
-  checkRecalculation,
-  calculateStopLoss,
-  calculateTargets,
+  detectBias, checkInvalidation, calculateZones,
+  checkRecalculation, getPriceZone, calculateSL,
+  calculateTargets, candlesAfter,
 } = require("./biasEngine");
-
+const { FRACTAL_STACKS, HTF_TIMEFRAMES, BIAS_ONLY_TIMEFRAMES, getTfLabel } = require("../../config/markets");
+const { fetchCandles, fetchCurrentPrice, isTimeframeAvailable } = require("../scanner/dataProvider");
 const logger = require("../utils/logger");
 
-/**
- * RUN 3-STEP FRACTAL ANALYSIS
- * HTF → MTF → LTF
- *
- * Returns a signal object if all 3 TFs align, otherwise null.
- *
- * @param {object} params
- *   symbol       - instrument symbol
- *   stack        - { id, label, htf, mtf, ltf }
- *   htfCandles   - OHLC array for HTF (closed candles, newest last)
- *   mtfCandles   - OHLC array for MTF
- *   ltfCandles   - OHLC array for LTF
- *   currentPrice - latest tick price
- */
-async function runThreeStepFractal({ symbol, stack, htfCandles, mtfCandles, ltfCandles, currentPrice }) {
-  const tag = `[3-Step][${symbol}][${stack.id}]`;
+// ─────────────────────────────────────────────────────────────────────────────
+// MODE 0: BIAS ONLY — scan all TFs, return bias state per TF, no zones/entry
+// ─────────────────────────────────────────────────────────────────────────────
 
-  // ── STEP 1: HTF Bias ──────────────────────────────────────────────────────
-  const htfBias = detectBias(htfCandles);
-  if (!htfBias) {
-    logger.debug(`${tag} No HTF bias detected`);
-    return null;
-  }
+async function runBiasOnly(symbol) {
+  const results = {};
+  const tfs = BIAS_ONLY_TIMEFRAMES;
 
-  // Check HTF invalidation with candles after C2
-  const htfPostC2 = getCandlesAfter(htfCandles, htfBias.C2);
-  if (checkInvalidation(htfBias, htfPostC2)) {
-    logger.debug(`${tag} HTF bias invalidated`);
-    return null;
-  }
+  const candlesets = await Promise.all(
+    tfs.map(tf => fetchCandles(symbol, tf, 10))
+  );
 
-  // ── STEP 2: HTF Zones & Price In Zone ────────────────────────────────────
-  let htfZones = calculateZones(htfBias);
-  const htfZoneHit = getPriceZone(currentPrice, htfZones);
-
-  // Check recalculation condition
-  if (!htfZoneHit) {
-    const recalcZones = checkRecalculation(htfZones, currentPrice, htfBias);
-    if (recalcZones) {
-      logger.debug(`${tag} HTF zones recalculated`);
-      htfZones = recalcZones;
+  for (let i = 0; i < tfs.length; i++) {
+    const tf = tfs[i];
+    const candles = candlesets[i];
+    if (!candles || candles.length < 2) {
+      results[tf] = { bias: "NO DATA", C1: null, C2: null };
+      continue;
+    }
+    const b = detectBias(candles);
+    if (!b) {
+      results[tf] = { bias: "NEUTRAL", C1: candles[candles.length-2], C2: candles[candles.length-1] };
     } else {
-      logger.debug(`${tag} Price not in HTF zone (${currentPrice}), no recalc`);
-      return null;
+      // Check invalidation
+      const post = candlesAfter(candles, b.C2);
+      const invalid = checkInvalidation(b, post);
+      results[tf] = {
+        bias: invalid ? "INVALIDATED" : b.bias,
+        C1: b.C1,
+        C2: b.C2,
+        passed: b.passed,
+        invalidated: invalid,
+      };
     }
   }
 
-  const activeHTFZone = getPriceZone(currentPrice, htfZones) || "Zone1(recalc)";
-
-  // ── STEP 3: MTF Bias (must match HTF) ────────────────────────────────────
-  const mtfBias = detectBias(mtfCandles);
-  if (!mtfBias || mtfBias.bias !== htfBias.bias) {
-    logger.debug(`${tag} MTF bias mismatch or absent`);
-    return null;
-  }
-
-  const mtfPostC2 = getCandlesAfter(mtfCandles, mtfBias.C2);
-  if (checkInvalidation(mtfBias, mtfPostC2)) {
-    logger.debug(`${tag} MTF bias invalidated`);
-    return null;
-  }
-
-  const mtfZones = calculateZones(mtfBias);
-
-  // ── STEP 4: LTF Bias (must match HTF/MTF) ────────────────────────────────
-  const ltfBias = detectBias(ltfCandles);
-  if (!ltfBias || ltfBias.bias !== htfBias.bias) {
-    logger.debug(`${tag} LTF bias mismatch or absent`);
-    return null;
-  }
-
-  const ltfPostC2 = getCandlesAfter(ltfCandles, ltfBias.C2);
-  if (checkInvalidation(ltfBias, ltfPostC2)) {
-    logger.debug(`${tag} LTF bias invalidated`);
-    return null;
-  }
-
-  // ── STEP 5: Build Signal ──────────────────────────────────────────────────
-  // Entry at midpoint of LTF Zone1 (highest precision entry)
-  const ltfZones = calculateZones(ltfBias);
-  const entry = midpoint(ltfZones.zone1);
-
-  // SL: 3-step mode → beyond MTF zone
-  const sl = calculateStopLoss(htfBias.bias, mtfZones, computeBuffer(symbol));
-  const { tp1, tp2 } = calculateTargets(htfBias.bias, entry, sl);
-
-  logger.info(`${tag} ✅ SIGNAL GENERATED — ${htfBias.bias}`);
-
-  return {
-    symbol,
-    mode: "3-Step",
-    bias: htfBias.bias,
-    timeframeLabel: stack.label,
-    htf: stack.htf,
-    mtf: stack.mtf,
-    ltf: stack.ltf,
-    entry,
-    sl,
-    tp1,
-    tp2,
-    zone: activeHTFZone,
-    htfZones,
-    mtfZones,
-    ltfZones,
-    htfBias,
-    mtfBias,
-    ltfBias,
-    status: "ACTIVE",
-    timestamp: new Date().toISOString(),
-  };
+  return results;
 }
 
-/**
- * RUN 2-STEP FRACTAL ANALYSIS
- * HTF → LTF (skip MTF)
- *
- * @param {object} params
- *   symbol       - instrument symbol
- *   stack        - { id, label, htf, ltf }
- *   htfCandles   - OHLC array for HTF
- *   ltfCandles   - OHLC array for LTF
- *   currentPrice - latest tick price
- */
-async function runTwoStepFractal({ symbol, stack, htfCandles, ltfCandles, currentPrice }) {
-  const tag = `[2-Step][${symbol}][${stack.id}]`;
+// ─────────────────────────────────────────────────────────────────────────────
+// FULL SCAN — Step 1: find all HTF biases
+//             Step 2: for each HTF bias, run its fractal stack
+//             Returns array of signal objects (one per successful stack)
+// ─────────────────────────────────────────────────────────────────────────────
 
-  // ── STEP 1: HTF Bias ──────────────────────────────────────────────────────
-  const htfBias = detectBias(htfCandles);
-  if (!htfBias) {
-    logger.debug(`${tag} No HTF bias detected`);
-    return null;
-  }
+async function runFullScan(symbol) {
+  const signals = [];
+  const analysisLog = []; // full step-by-step log for analysis mode
 
-  const htfPostC2 = getCandlesAfter(htfCandles, htfBias.C2);
-  if (checkInvalidation(htfBias, htfPostC2)) {
-    logger.debug(`${tag} HTF bias invalidated`);
-    return null;
-  }
+  const currentPrice = await fetchCurrentPrice(symbol);
+  if (!currentPrice) return { signals, analysisLog, error: "Could not fetch price" };
 
-  // ── STEP 2: HTF Zones & Price In Zone ────────────────────────────────────
-  let htfZones = calculateZones(htfBias);
-  const htfZoneHit = getPriceZone(currentPrice, htfZones);
+  // ── Step 1: fetch all HTF candles and detect biases ───────────────────────
+  const htfCandles = {};
+  const htfBiases  = {};
 
-  if (!htfZoneHit) {
-    const recalcZones = checkRecalculation(htfZones, currentPrice, htfBias);
-    if (recalcZones) {
-      htfZones = recalcZones;
-      logger.debug(`${tag} HTF zones recalculated`);
-    } else {
-      logger.debug(`${tag} Price not in HTF zone`);
-      return null;
+  const htfFetches = await Promise.all(
+    HTF_TIMEFRAMES.map(tf => fetchCandles(symbol, tf, 10))
+  );
+
+  for (let i = 0; i < HTF_TIMEFRAMES.length; i++) {
+    const tf = HTF_TIMEFRAMES[i];
+    const candles = htfFetches[i];
+    htfCandles[tf] = candles;
+
+    if (!candles || candles.length < 2) {
+      analysisLog.push({ tf, step: "htf_bias", result: "NO DATA" });
+      continue;
     }
+
+    const b = detectBias(candles);
+    if (!b) {
+      analysisLog.push({ tf, step: "htf_bias", result: "NEUTRAL", C1: candles[candles.length-2], C2: candles[candles.length-1] });
+      continue;
+    }
+
+    const post = candlesAfter(candles, b.C2);
+    if (checkInvalidation(b, post)) {
+      analysisLog.push({ tf, step: "htf_bias", result: "INVALIDATED", bias: b.bias, C1: b.C1, C2: b.C2 });
+      continue;
+    }
+
+    htfBiases[tf] = b;
+    analysisLog.push({ tf, step: "htf_bias", result: "FOUND", bias: b.bias, C1: b.C1, C2: b.C2, passed: b.passed });
   }
 
-  const activeHTFZone = getPriceZone(currentPrice, htfZones) || "Zone1(recalc)";
-
-  // ── STEP 3: LTF Bias (must match HTF) ────────────────────────────────────
-  const ltfBias = detectBias(ltfCandles);
-  if (!ltfBias || ltfBias.bias !== htfBias.bias) {
-    logger.debug(`${tag} LTF bias mismatch or absent`);
-    return null;
+  const biasesFound = Object.keys(htfBiases);
+  if (!biasesFound.length) {
+    return { signals, analysisLog, currentPrice, noHTFBias: true };
   }
 
-  const ltfPostC2 = getCandlesAfter(ltfCandles, ltfBias.C2);
-  if (checkInvalidation(ltfBias, ltfPostC2)) {
-    logger.debug(`${tag} LTF bias invalidated`);
-    return null;
+  // ── Step 2: for each HTF bias, run its fractal stack ─────────────────────
+  for (const htfTf of biasesFound) {
+    const htfBias  = htfBiases[htfTf];
+    const stack    = FRACTAL_STACKS[htfTf];
+    if (!stack) continue;
+
+    const stackLog = { htfTf, htfBias: htfBias.bias, steps: [] };
+
+    // Step 2a: HTF zones
+    let htfZones = calculateZones(htfBias);
+    let zoneHit  = getPriceZone(currentPrice, htfZones);
+
+    // Recalculation check
+    if (!zoneHit) {
+      const recalc = checkRecalculation(htfZones, currentPrice, htfBias);
+      if (recalc) {
+        htfZones = recalc;
+        zoneHit  = getPriceZone(currentPrice, htfZones);
+        stackLog.steps.push({ step: "htf_zones", result: "RECALCULATED", zones: htfZones, zoneHit });
+      } else {
+        stackLog.steps.push({ step: "htf_zones", result: "PRICE_NOT_IN_ZONE", zones: htfZones, currentPrice });
+        analysisLog.push(stackLog);
+        continue;
+      }
+    } else {
+      stackLog.steps.push({ step: "htf_zones", result: "ZONE_HIT", zones: htfZones, zoneHit });
+    }
+
+    // Step 2b: MTF — check priority order, take first with same bias in zone
+    const mtfTfs = stack.mtfOptions;
+    let chosenMtf = null;
+    let mtfBias   = null;
+    let mtfZones  = null;
+
+    const mtfCandles = await Promise.all(
+      mtfTfs.map(tf => fetchCandles(symbol, tf, 10))
+    );
+
+    for (let i = 0; i < mtfTfs.length; i++) {
+      const tf = mtfTfs[i];
+      const candles = mtfCandles[i];
+      if (!candles || candles.length < 2) continue;
+
+      const b = detectBias(candles);
+      if (!b || b.bias !== htfBias.bias) {
+        stackLog.steps.push({ step: "mtf_check", tf, result: b ? `MISMATCH (${b.bias})` : "NEUTRAL" });
+        continue;
+      }
+
+      const post = candlesAfter(candles, b.C2);
+      if (checkInvalidation(b, post)) {
+        stackLog.steps.push({ step: "mtf_check", tf, result: "INVALIDATED" });
+        continue;
+      }
+
+      chosenMtf = tf;
+      mtfBias   = b;
+      mtfZones  = calculateZones(b);
+      stackLog.steps.push({ step: "mtf_check", tf, result: "CONFIRMED", bias: b.bias, C1: b.C1, C2: b.C2, zones: mtfZones, quality: i === 0 ? "HIGH" : "STANDARD" });
+      break;
+    }
+
+    if (!chosenMtf) {
+      stackLog.steps.push({ step: "mtf_result", result: "NO_MTF_ALIGNMENT" });
+      analysisLog.push(stackLog);
+      continue;
+    }
+
+    // Step 2c: LTF — confirm same bias, this triggers entry
+    let ltfTf = stack.ltf;
+
+    // If ltf is 1min, check availability
+    if (ltfTf === "1min") {
+      const avail = await isTimeframeAvailable(symbol, "1min");
+      if (!avail) ltfTf = "5min";
+    }
+
+    const ltfCandles = await fetchCandles(symbol, ltfTf, 10);
+    if (!ltfCandles || ltfCandles.length < 2) {
+      stackLog.steps.push({ step: "ltf_check", tf: ltfTf, result: "NO DATA" });
+      analysisLog.push(stackLog);
+      continue;
+    }
+
+    const ltfB = detectBias(ltfCandles);
+    if (!ltfB || ltfB.bias !== htfBias.bias) {
+      stackLog.steps.push({ step: "ltf_check", tf: ltfTf, result: ltfB ? `MISMATCH (${ltfB.bias})` : "NEUTRAL" });
+      analysisLog.push(stackLog);
+      continue;
+    }
+
+    const ltfPost = candlesAfter(ltfCandles, ltfB.C2);
+    if (checkInvalidation(ltfB, ltfPost)) {
+      stackLog.steps.push({ step: "ltf_check", tf: ltfTf, result: "INVALIDATED" });
+      analysisLog.push(stackLog);
+      continue;
+    }
+
+    const ltfZones = calculateZones(ltfB);
+    stackLog.steps.push({ step: "ltf_check", tf: ltfTf, result: "CONFIRMED", bias: ltfB.bias, C1: ltfB.C1, C2: ltfB.C2, zones: ltfZones });
+
+    // ── Build signal ─────────────────────────────────────────────────────────
+    const entry = mid(ltfZones.zone1);
+    const sl    = calculateSL(htfBias.bias, mtfZones, symbol);
+    const { tp1, tp2 } = calculateTargets(htfBias.bias, entry, sl);
+
+    const signal = {
+      symbol,
+      bias:    htfBias.bias,
+      htfTf,
+      mtfTf:   chosenMtf,
+      mtfQuality: mtfTfs.indexOf(chosenMtf) === 0 ? "HIGH" : "STANDARD",
+      ltfTf,
+      tfLabel: `${getTfLabel(htfTf)} → ${getTfLabel(chosenMtf)} → ${getTfLabel(ltfTf)}`,
+      entry, sl, tp1, tp2,
+      zone:    zoneHit,
+      rr:      (Math.abs(tp2 - entry) / Math.abs(entry - sl)).toFixed(1),
+      htfBias, htfZones,
+      mtfBias, mtfZones,
+      ltfBias: ltfB, ltfZones,
+      currentPrice,
+      status:  "ACTIVE",
+      timestamp: new Date().toISOString(),
+    };
+
+    stackLog.steps.push({ step: "signal_built", result: "SUCCESS", signal });
+    signals.push(signal);
+    analysisLog.push(stackLog);
+    logger.info(`[${symbol}] SIGNAL: ${htfBias.bias} | ${getTfLabel(htfTf)}→${getTfLabel(chosenMtf)}→${getTfLabel(ltfTf)} | Entry ${entry}`);
   }
 
-  // ── STEP 4: Build Signal ──────────────────────────────────────────────────
-  const ltfZones = calculateZones(ltfBias);
-  const entry = midpoint(ltfZones.zone1);
-
-  // SL: 2-step mode → beyond HTF zone
-  const sl = calculateStopLoss(htfBias.bias, htfZones, computeBuffer(symbol));
-  const { tp1, tp2 } = calculateTargets(htfBias.bias, entry, sl);
-
-  logger.info(`${tag} ✅ SIGNAL GENERATED — ${htfBias.bias}`);
-
-  return {
-    symbol,
-    mode: "2-Step",
-    bias: htfBias.bias,
-    timeframeLabel: stack.label,
-    htf: stack.htf,
-    ltf: stack.ltf,
-    entry,
-    sl,
-    tp1,
-    tp2,
-    zone: activeHTFZone,
-    htfZones,
-    ltfZones,
-    htfBias,
-    ltfBias,
-    status: "ACTIVE",
-    timestamp: new Date().toISOString(),
-  };
+  return { signals, analysisLog, currentPrice, htfBiases };
 }
 
-// ─── Helpers ──────────────────────────────────────────────────────────────────
-
-/**
- * Get candles that formed AFTER a reference candle (by timestamp comparison)
- */
-function getCandlesAfter(candles, referenceCandle) {
-  if (!referenceCandle || !referenceCandle.datetime) return [];
-  return candles.filter(c => new Date(c.datetime) > new Date(referenceCandle.datetime));
+function mid(zone) {
+  const v = (zone.high + zone.low) / 2;
+  return Math.round(v * 100000) / 100000;
 }
 
-function midpoint(zone) {
-  return Math.round(((zone.high + zone.low) / 2) * 100000) / 100000;
-}
-
-/**
- * Compute a small buffer for SL based on instrument type
- * Prevents SL being placed exactly at zone boundary
- */
-function computeBuffer(symbol) {
-  if (symbol.includes("XAU") || symbol.includes("GOLD")) return 1.0;   // $1 Gold
-  if (symbol.includes("BTC")) return 50;                                  // $50 BTC
-  if (symbol.includes("JPY")) return 0.02;                               // 2 pips JPY
-  if (symbol.includes("SPX") || symbol.includes("NAS")) return 2.0;     // 2pts index
-  return 0.0005; // ~0.5 pip default for Forex
-}
-
-module.exports = { runThreeStepFractal, runTwoStepFractal };
+module.exports = { runBiasOnly, runFullScan };
