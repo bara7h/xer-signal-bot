@@ -297,54 +297,68 @@ async function handleDiagnose(msg) {
   const hasKey    = !!(process.env.TWELVE_DATA_API_KEY &&
                        process.env.TWELVE_DATA_API_KEY !== "YOUR_TWELVE_DATA_KEY_HERE" &&
                        process.env.TWELVE_DATA_API_KEY.length > 10);
-  const rateLimit = parseInt(process.env.API_RATE_LIMIT || "6");
-  const interval  = parseInt(process.env.SCAN_INTERVAL_SECONDS || "300");
-  const wl        = scanner.getWatchlist();
-  const callsPerScan = wl.length * 4;
-  const minsNeeded   = Math.ceil(callsPerScan / rateLimit);
+  const delay    = parseInt(process.env.API_CALL_DELAY_MS || "2000");
+  const interval = parseInt(process.env.SCAN_INTERVAL_SECONDS || "120");
+  const wl       = scanner.getWatchlist();
+
+  // New architecture: 1 API call per instrument (all TFs in one request)
+  // plus ~1 call for price if not cached = ~1 call per instrument total
+  const callsPerScan   = wl.length;
+  const secsPerScan    = Math.ceil(callsPerScan * delay / 1000);
+  const callsPerDay    = Math.floor(86400 / interval) * callsPerScan;
+  const intervalOk     = secsPerScan < interval;
 
   let out = "🔷 *XERO EDGE™ Diagnostics*\n";
   out += "━━━━━━━━━━━━━━━━━━━━━━\n\n";
   out += "*Environment*\n";
   out += "DATA_PROVIDER: `" + provider + "`\n";
   out += "TWELVE_DATA_API_KEY: " + (hasKey ? "✅ Set" : "❌ NOT SET") + "\n";
-  out += "API_RATE_LIMIT: `" + rateLimit + "` req/min\n";
+  out += "API_CALL_DELAY_MS: `" + delay + "ms`\n";
   out += "SCAN_INTERVAL: `" + interval + "s`\n\n";
 
-  out += "*Rate Limit Check*\n";
+  out += "*API Usage (new efficient architecture)*\n";
   out += "Watchlist: `" + wl.length + "` instruments\n";
-  out += "Calls per scan: `" + callsPerScan + "`\n";
-  out += "At " + rateLimit + " req/min needs `" + minsNeeded + " min` per scan\n";
-  out += (minsNeeded * 60 > interval
-    ? "⚠️ SCAN_INTERVAL too short! Set to `" + (minsNeeded * 60 + 60) + "` or higher\n"
-    : "✅ Rate limit OK for watchlist size\n");
+  out += "Calls per scan: `" + callsPerScan + "` (1 per instrument)\n";
+  out += "Scan duration: ~`" + secsPerScan + "s`\n";
+  out += "Daily calls at " + interval + "s interval: ~`" + callsPerDay + "`\n";
+  out += (callsPerDay > 800
+    ? "⚠️ May hit 800/day free limit — increase SCAN_INTERVAL_SECONDS\n"
+    : "✅ Well within free tier 800 req/day\n");
+  out += (intervalOk ? "✅ SCAN_INTERVAL is sufficient\n" : "⚠️ SCAN_INTERVAL too short — set to `" + (secsPerScan + 30) + "` or higher\n");
   out += "\n";
 
   out += "*API Connection*\n";
   const check = await validateConnection();
-  out += (check.ok ? "✅ " : "❌ ") + check.message + "\n\n";
+  out += (check.ok ? "✅ " : "❌ ") + check.message + "\n";
+
+  if (check.message && check.message.includes("429")) {
+    out += "\n⏰ *429 = Daily credits exhausted*\n";
+    out += "Free tier resets at midnight UTC.\n";
+    out += "Meanwhile set DATA_PROVIDER=mock to test the bot works.\n";
+  }
+  out += "\n";
 
   if (provider !== "mock" && hasKey && check.ok) {
-    out += "*Live Candle Test (EURUSD 1H)*\n";
+    out += "*Live Candle Test (EUR/USD 1H)*\n";
     try {
       const candles = await fetchCandles("EUR/USD", "1h", 3);
       if (candles && candles.length > 0) {
         const c = candles[candles.length - 1];
         out += "✅ Got " + candles.length + " candles\n";
-        out += "Last: H`" + c.high + "` L`" + c.low + "` C`" + c.close + "`\n";
+        out += "Last close: `" + c.close + "`\n";
       } else {
-        out += "❌ No candles returned\n";
-        out += "Check: symbol format, API key permissions, free tier limits\n";
+        out += "❌ No candles returned — API key may lack permissions\n";
       }
     } catch (e) {
-      out += "❌ Error: " + e.message + "\n";
+      out += "❌ " + e.message + "\n";
     }
+    out += "\n";
   }
 
-  out += "\n━━━━━━━━━━━━━━━━━━━━━━\n";
-  if (!hasKey) out += "⚡ Fix: add TWELVE_DATA_API_KEY in Railway Variables\n";
-  if (minsNeeded * 60 > interval) out += "⚡ Fix: set SCAN_INTERVAL_SECONDS=" + (minsNeeded * 60 + 60) + " in Railway\n";
-  if (provider === "mock") out += "ℹ️ Running in MOCK mode — set DATA_PROVIDER=twelve_data for live data\n";
+  out += "━━━━━━━━━━━━━━━━━━━━━━\n";
+  if (!hasKey) out += "⚡ Add TWELVE_DATA_API_KEY in Railway Variables\n";
+  if (!intervalOk) out += "⚡ Set SCAN_INTERVAL_SECONDS=" + (secsPerScan + 30) + " in Railway\n";
+  if (provider === "mock") out += "ℹ️ Mock mode active — switch DATA_PROVIDER=twelve_data for live markets\n";
 
   await safeSend(chatId, out);
 }
