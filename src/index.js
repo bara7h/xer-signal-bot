@@ -9,6 +9,17 @@ async function main() {
   logger.info("  XERO TRADERS HUB | Pondicherry, India");
   logger.info("═══════════════════════════════════════════════════");
 
+  // Validate API connection before starting
+  const { validateConnection } = require("./scanner/dataProvider");
+  const check = await validateConnection();
+  if (!check.ok) {
+    logger.error("DATA CONNECTION FAILED: " + check.message);
+    logger.error("Fix this before the bot can scan live markets.");
+    logger.error("To test without an API key, set DATA_PROVIDER=mock in Railway variables.");
+  } else {
+    logger.info("Data connection: " + check.message);
+  }
+
   initBot();
 
   scanner.onSignal(broadcastSignal);

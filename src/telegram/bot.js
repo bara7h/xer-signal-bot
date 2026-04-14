@@ -406,6 +406,81 @@ async function handleUnsubscribe(msg) {
   await safeSend(msg.chat.id, `🔕 Unsubscribed. Use /subscribe to re-enable.`);
 }
 
+async function handleDiagnose(msg) {
+  const chatId = msg.chat.id;
+  await safeSend(chatId, "🔍 *Running diagnostics...*");
+
+  const { validateConnection } = require("../scanner/dataProvider");
+  const { DEFAULT_WATCHLIST } = require("../../config/markets");
+
+  const lines = [];
+  lines.push("🔷 *XERO EDGE™ Diagnostics*");
+  lines.push("━━━━━━━━━━━━━━━━━━━━━━");
+  lines.push("");
+
+  // Environment
+  const provider = process.env.DATA_PROVIDER || "mock";
+  const hasKey   = !!(process.env.TWELVE_DATA_API_KEY && process.env.TWELVE_DATA_API_KEY !== "YOUR_TWELVE_DATA_KEY_HERE");
+  const hasToken = !!(process.env.TELEGRAM_BOT_TOKEN);
+  const rateLimit = process.env.API_RATE_LIMIT || "6";
+  const interval  = process.env.SCAN_INTERVAL_SECONDS || "300";
+
+  lines.push("*Environment*");
+  lines.push(`DATA_PROVIDER: \`${provider}\``);
+  lines.push(`TWELVE_DATA_API_KEY: ${hasKey ? "✅ Set" : "❌ Missing"}`);
+  lines.push(`TELEGRAM_BOT_TOKEN: ${hasToken ? "✅ Set" : "❌ Missing"}`);
+  lines.push(`API_RATE_LIMIT: \`${rateLimit}/min\``);
+  lines.push(`SCAN_INTERVAL: \`${interval}s\``);
+  lines.push("");
+
+  // API connection test
+  lines.push("*API Connection Test*");
+  const check = await validateConnection();
+  lines.push(check.ok ? `✅ ${check.message}` : `❌ ${check.message}`);
+  lines.push("");
+
+  // Rate limit warning
+  const wl = scanner.getWatchlist();
+  const callsPerScan = wl.length * 4; // 4 HTF timeframes
+  const minutesNeeded = Math.ceil(callsPerScan / parseInt(rateLimit));
+  lines.push("*Rate Limit Check*");
+  lines.push(`Watchlist: \`${wl.length}\` instruments`);
+  lines.push(`HTF calls per scan: \`${callsPerScan}\``);
+  lines.push(`At ${rateLimit} req/min → needs \`${minutesNeeded} min\` per full scan`);
+  if (minutesNeeded > 2) {
+    lines.push(`⚠️ Consider reducing watchlist or upgrading Twelve Data plan`);
+    lines.push(`Tip: set \`SCAN_INTERVAL_SECONDS=${minutesNeeded * 60 + 60}\` in Railway`);
+  } else {
+    lines.push("✅ Rate limit looks fine for your watchlist size");
+  }
+  lines.push("");
+
+  // Quick candle test
+  if (provider !== "mock" && hasKey) {
+    lines.push("*Live Candle Test (EUR/USD 1H)*");
+    try {
+      const { fetchCandles } = require("../scanner/dataProvider");
+      const candles = await fetchCandles("EUR/USD", "1h", 3);
+      if (candles && candles.length > 0) {
+        const last = candles[candles.length - 1];
+        lines.push(`✅ Got ${candles.length} candles`);
+        lines.push(`Last: O:\`${last.open}\` H:\`${last.high}\` L:\`${last.low}\` C:\`${last.close}\``);
+      } else {
+        lines.push("❌ No candles returned — check API key and symbol support");
+      }
+    } catch(e) {
+      lines.push(`❌ Error: ${e.message}`);
+    }
+  }
+
+  lines.push("");
+  lines.push("━━━━━━━━━━━━━━━━━━━━━━");
+  lines.push("_If API key is missing: add TWELVE\_DATA\_API\_KEY in Railway Variables_");
+  lines.push("_If rate limited: increase SCAN\_INTERVAL\_SECONDS or set API\_RATE\_LIMIT=6_");
+
+  await safeSend(chatId, lines.join("\n"));
+}
+
 // ── Shared helpers ────────────────────────────────────────────────────────────
 
 async function setOutput(chatId, mode) {
