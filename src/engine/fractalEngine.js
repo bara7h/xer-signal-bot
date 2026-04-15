@@ -50,6 +50,7 @@ async function runBiasOnly(symbol, onProgress) {
 async function runFullScan(symbol, onProgress) {
   const signals    = [];
   const analysisLog = [];
+  const watchingSetups = []; // HTF bias found but price not in zone yet
 
   // Single batch call — gets ALL timeframes at once
   if (onProgress) await onProgress("📡 Fetching "+symbol+" data...");
@@ -125,6 +126,8 @@ async function runFullScan(symbol, onProgress) {
 
     if (!zoneHit) {
       stackLog.steps.push({ step:"htf_zones", result:"PRICE_NOT_IN_ZONE", zones:htfZones, currentPrice });
+      // Save as a watching setup — price not in zone yet but bias is valid
+      watchingSetups.push({ symbol, displayName: symbol, htfTf, bias:htfBias.bias, htfBias, htfZones });
       analysisLog.push(stackLog); continue;
     }
     stackLog.steps.push({ step:"htf_zones", result:"ZONE_HIT", zones:htfZones, zoneHit });
@@ -205,7 +208,7 @@ async function runFullScan(symbol, onProgress) {
     logger.info("["+symbol+"] SIGNAL: "+htfBias.bias+" "+getTfLabel(htfTf)+"→"+getTfLabel(chosenMtf)+"→"+getTfLabel(ltfTf)+" entry:"+entry);
   }
 
-  return { signals, analysisLog, currentPrice, htfBiases, noHTFBias:false };
+  return { signals, analysisLog, watchingSetups, currentPrice, htfBiases, noHTFBias:false };
 }
 
 function mid(zone) { return Math.round((zone.high+zone.low)/2*100000)/100000; }

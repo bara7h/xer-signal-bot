@@ -3,6 +3,7 @@
 // ─────────────────────────────────────────────────────────────────────────────
 
 const { runFullScan, runBiasOnly } = require("../engine/fractalEngine");
+const zoneWatcher = require("./zoneWatcher");
 const { DEFAULT_WATCHLIST } = require("../../config/markets");
 const logger = require("../utils/logger");
 
@@ -47,6 +48,16 @@ async function scanInstruments(instruments, onProgress) {
             try { await fn(signal); } catch(e) { logger.error("Listener: "+e.message); }
           }
         }
+      }
+      // Register watching setups with zone watcher
+      for (const ws of (result.watchingSetups||[])) {
+        ws.displayName = inst.displayName;
+        ws.symbol = inst.symbol;
+        zoneWatcher.addWatching(ws);
+      }
+      // Register confirmed signals with zone watcher for invalidation monitoring
+      for (const signal of (result.signals||[])) {
+        zoneWatcher.addActiveSignal(signal);
       }
       results.push({ symbol: inst.displayName, result });
     } catch(e) {

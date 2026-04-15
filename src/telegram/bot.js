@@ -7,7 +7,8 @@ const scanner     = require("../scanner/scanner");
 const { parseIntent }    = require("../nlp/nlpEngine");
 const { formatBiasOnly, formatSignal, formatAnalysis,
         formatScanSummary, formatNoSignal } = require("../output/formatter");
-const { DEFAULT_WATCHLIST } = require("../../config/markets");
+const { DEFAULT_WATCHLIST, getTfLabel } = require("../../config/markets");
+const zoneWatcher = require("../scanner/zoneWatcher");
 const logger = require("../utils/logger");
 
 const TOKEN    = process.env.TELEGRAM_BOT_TOKEN;
@@ -40,6 +41,7 @@ function initBot() {
   bot.onText(/^\/subscribe$/,   msg => wrap(handleSubscribe, msg));
   bot.onText(/^\/unsubscribe$/, msg => wrap(handleUnsubscribe, msg));
 
+  bot.onText(/^\/watching$/, msg => wrap(handleWatching, msg));
   bot.onText(/^\/scan(.*)$/,    (msg, m) => wrap(handleSlashScan,   msg, (m[1]||"").trim()));
   bot.onText(/^\/bias(.*)$/,    (msg, m) => wrap(handleSlashBias,   msg, (m[1]||"").trim()));
   bot.onText(/^\/output (.+)$/, (msg, m) => wrap(handleOutputSet,   msg, m[1].trim()));
@@ -536,4 +538,111 @@ async function safeSend(chatId, text) {
 
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
-module.exports = { initBot, broadcastSignal };
+async function handleWatching(msg) {
+  const chatId   = msg.chat.id;
+  const watching = zoneWatcher.getWatchingSetups();
+  const active   = zoneWatcher.getActiveSignals();
+
+  if (!watching.length && !active.length) {
+    await safeSend(chatId, "👁 No setups being watched right now.
+
+Run a scan first — setups where price hasn't hit the zone yet will be automatically tracked.");
+    return;
+  }
+
+  let out = "👁 *XERO EDGE™ — Zone Watch*
+━━━━━━━━━━━━━━━━━━━━━━
+
+";
+
+  if (watching.length) {
+    out += "*⏳ Waiting for price to enter zone:*
+";
+    for (const s of watching) {
+      const isBull = s.bias === "BULLISH";
+      const z1 = s.htfZones.zone1;
+      const fmt = s.symbol.includes("JPY") || s.symbol.includes("XAU") || s.symbol.includes("BTC")
+        ? n => Number(n).toFixed(2) : n => Number(n).toFixed(5);
+      out += (isBull ? "🟢" : "🔴") + " `" + s.symbol + "` " + s.bias + " — " + getTfLabel(s.htfTf) + "
+";
+      out += "   Zone 1: `" + fmt(z1.low) + "` – `" + fmt(z1.high) + "`
+";
+      out += "   Added: " + new Date(s.addedAt).toUTCString().split(" ").slice(0,5).join(" ") + "
+
+";
+    }
+  }
+
+  if (active.length) {
+    out += "*🎯 Active signals (monitoring for invalidation):*
+";
+    for (const s of active) {
+      const isBull = s.bias === "BULLISH";
+      const fmt = s.symbol.includes("JPY") || s.symbol.includes("XAU") || s.symbol.includes("BTC")
+        ? n => Number(n).toFixed(2) : n => Number(n).toFixed(5);
+      out += (isBull ? "🟢" : "🔴") + " `" + s.symbol + "` " + s.bias + " — " + s.tfLabel + "
+";
+      out += "   Entry: `" + fmt(s.entry) + "` | SL: `" + fmt(s.sl) + "`
+
+";
+    }
+  }
+
+  out += "━━━━━━━━━━━━━━━━━━━━━━
+_Bot checks prices every 30s and alerts instantly on zone hit._";
+  await safeSend(chatId, out);
+}
+
+async function broadcastAlert(info) {
+  if (!bot) { logger.info("ALERT: " + JSON.stringify(info)); return; }
+
+  let msg = "";
+  const fmt = (sym, n) => {
+    if (!n) return "N/A";
+    return (sym.includes("JPY")||sym.includes("XAU")||sym.includes("BTC"))
+      ? Number(n).toFixed(2) : Number(n).toFixed(5);
+  };
+
+  if (info.type === "approaching") {
+    msg = "⚡ *ZONE APPROACHING — " + info.symbol + "*
+" +
+      "━━━━━━━━━━━━━━━━━━━━━━
+" +
+      (info.bias === "BULLISH" ? "🟢" : "🔴") + " " + info.bias + " | " + getTfLabel(info.htfTf) + "
+" +
+      "Current price `" + fmt(info.symbol, info.price) + "` is approaching the entry zone.
+" +
+      "Zone 1: `" + fmt(info.symbol, info.zones.zone1.low) + "` – `" + fmt(info.symbol, info.zones.zone1.high) + "`
+
+" +
+      "_Get ready — monitoring for entry confirmation._";
+  }
+
+  if (info.type === "invalidation") {
+    const prefix = info.sl ? "Price hit stop loss" : "Bias invalidated";
+    msg = "❌ *SETUP CANCELLED — " + info.symbol + "*
+" +
+      "━━━━━━━━━━━━━━━━━━━━━━
+" +
+      (info.bias === "BULLISH" ? "🟢" : "🔴") + " " + info.bias + " setup on " + getTfLabel(info.htfTf) + " is no longer valid.
+
+" +
+      "*Reason:* " + info.reason + "
+" +
+      (info.price ? "Price: `" + fmt(info.symbol, info.price) + "`
+" : "") +
+      (info.sl    ? "SL was: `" + fmt(info.symbol, info.sl) + "`
+" : "") +
+      "
+_Setup removed. Waiting for new structure to form._";
+  }
+
+  if (!msg) return;
+
+  for (const chatId of authorizedChats) {
+    try { await bot.sendMessage(chatId, msg, { parse_mode:"Markdown" }); }
+    catch(e) { logger.error("broadcastAlert to " + chatId + ": " + e.message); }
+  }
+}
+
+module.exports = { initBot, broadcastSignal, broadcastAlert };
