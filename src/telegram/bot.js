@@ -544,105 +544,96 @@ async function handleWatching(msg) {
   const active   = zoneWatcher.getActiveSignals();
 
   if (!watching.length && !active.length) {
-    await safeSend(chatId, "👁 No setups being watched right now.
-
-Run a scan first — setups where price hasn't hit the zone yet will be automatically tracked.");
+    await safeSend(chatId,
+      "No setups being watched right now.\n\n" +
+      "Run a scan first. Setups where price has not hit the zone yet are tracked automatically."
+    );
     return;
   }
 
-  let out = "👁 *XERO EDGE™ — Zone Watch*
-━━━━━━━━━━━━━━━━━━━━━━
-
-";
+  const lines = [
+    "*XERO EDGE - Zone Watch*",
+    "━━━━━━━━━━━━━━━━━━━━━━",
+    "",
+  ];
 
   if (watching.length) {
-    out += "*⏳ Waiting for price to enter zone:*
-";
+    lines.push("*Waiting for price to enter zone:*");
     for (const s of watching) {
       const isBull = s.bias === "BULLISH";
-      const z1 = s.htfZones.zone1;
-      const fmt = s.symbol.includes("JPY") || s.symbol.includes("XAU") || s.symbol.includes("BTC")
-        ? n => Number(n).toFixed(2) : n => Number(n).toFixed(5);
-      out += (isBull ? "🟢" : "🔴") + " `" + s.symbol + "` " + s.bias + " — " + getTfLabel(s.htfTf) + "
-";
-      out += "   Zone 1: `" + fmt(z1.low) + "` – `" + fmt(z1.high) + "`
-";
-      out += "   Added: " + new Date(s.addedAt).toUTCString().split(" ").slice(0,5).join(" ") + "
-
-";
+      const z1     = s.htfZones.zone1;
+      const f      = priceFmt(s.symbol);
+      lines.push((isBull ? "BUY" : "SELL") + " `" + s.symbol + "` " + s.bias + " — " + getTfLabel(s.htfTf));
+      lines.push("   Zone 1: `" + f(z1.low) + "` to `" + f(z1.high) + "`");
+      lines.push("   Watching since: " + new Date(s.addedAt).toUTCString().split(" ").slice(0,5).join(" "));
+      lines.push("");
     }
   }
 
   if (active.length) {
-    out += "*🎯 Active signals (monitoring for invalidation):*
-";
+    lines.push("*Active signals (watching for SL hit):*");
     for (const s of active) {
       const isBull = s.bias === "BULLISH";
-      const fmt = s.symbol.includes("JPY") || s.symbol.includes("XAU") || s.symbol.includes("BTC")
-        ? n => Number(n).toFixed(2) : n => Number(n).toFixed(5);
-      out += (isBull ? "🟢" : "🔴") + " `" + s.symbol + "` " + s.bias + " — " + s.tfLabel + "
-";
-      out += "   Entry: `" + fmt(s.entry) + "` | SL: `" + fmt(s.sl) + "`
-
-";
+      const f      = priceFmt(s.symbol);
+      lines.push((isBull ? "BUY" : "SELL") + " `" + s.symbol + "` " + s.bias + " — " + s.tfLabel);
+      lines.push("   Entry: `" + f(s.entry) + "` | SL: `" + f(s.sl) + "`");
+      lines.push("");
     }
   }
 
-  out += "━━━━━━━━━━━━━━━━━━━━━━
-_Bot checks prices every 30s and alerts instantly on zone hit._";
-  await safeSend(chatId, out);
+  lines.push("━━━━━━━━━━━━━━━━━━━━━━");
+  lines.push("_Bot checks price every 30s and alerts on zone hit._");
+
+  await safeSend(chatId, lines.join("\n"));
 }
 
 async function broadcastAlert(info) {
   if (!bot) { logger.info("ALERT: " + JSON.stringify(info)); return; }
 
-  let msg = "";
-  const fmt = (sym, n) => {
-    if (!n) return "N/A";
-    return (sym.includes("JPY")||sym.includes("XAU")||sym.includes("BTC"))
-      ? Number(n).toFixed(2) : Number(n).toFixed(5);
+  const f = (sym, n) => {
+    if (n === null || n === undefined) return "N/A";
+    return priceFmt(sym)(n);
   };
 
-  if (info.type === "approaching") {
-    msg = "⚡ *ZONE APPROACHING — " + info.symbol + "*
-" +
-      "━━━━━━━━━━━━━━━━━━━━━━
-" +
-      (info.bias === "BULLISH" ? "🟢" : "🔴") + " " + info.bias + " | " + getTfLabel(info.htfTf) + "
-" +
-      "Current price `" + fmt(info.symbol, info.price) + "` is approaching the entry zone.
-" +
-      "Zone 1: `" + fmt(info.symbol, info.zones.zone1.low) + "` – `" + fmt(info.symbol, info.zones.zone1.high) + "`
+  let lines = [];
 
-" +
-      "_Get ready — monitoring for entry confirmation._";
+  if (info.type === "approaching") {
+    lines = [
+      "ZONE APPROACHING — " + info.symbol,
+      "━━━━━━━━━━━━━━━━━━━━━━",
+      (info.bias === "BULLISH" ? "Bullish" : "Bearish") + " | " + getTfLabel(info.htfTf),
+      "Price `" + f(info.symbol, info.price) + "` is near the entry zone.",
+      "Zone 1: `" + f(info.symbol, info.zones.zone1.low) + "` to `" + f(info.symbol, info.zones.zone1.high) + "`",
+      "",
+      "_Get ready. Watching for entry confirmation._",
+    ];
   }
 
   if (info.type === "invalidation") {
-    const prefix = info.sl ? "Price hit stop loss" : "Bias invalidated";
-    msg = "❌ *SETUP CANCELLED — " + info.symbol + "*
-" +
-      "━━━━━━━━━━━━━━━━━━━━━━
-" +
-      (info.bias === "BULLISH" ? "🟢" : "🔴") + " " + info.bias + " setup on " + getTfLabel(info.htfTf) + " is no longer valid.
-
-" +
-      "*Reason:* " + info.reason + "
-" +
-      (info.price ? "Price: `" + fmt(info.symbol, info.price) + "`
-" : "") +
-      (info.sl    ? "SL was: `" + fmt(info.symbol, info.sl) + "`
-" : "") +
-      "
-_Setup removed. Waiting for new structure to form._";
+    lines = [
+      "SETUP CANCELLED — " + info.symbol,
+      "━━━━━━━━━━━━━━━━━━━━━━",
+      (info.bias === "BULLISH" ? "Bullish" : "Bearish") + " setup on " + getTfLabel(info.htfTf) + " cancelled.",
+      "Reason: " + info.reason,
+    ];
+    if (info.price) lines.push("Price: `" + f(info.symbol, info.price) + "`");
+    if (info.sl)    lines.push("SL was: `" + f(info.symbol, info.sl) + "`");
+    lines.push("", "_Setup removed. Waiting for new structure._");
   }
 
-  if (!msg) return;
+  if (!lines.length) return;
 
+  const text = lines.join("\n");
   for (const chatId of authorizedChats) {
-    try { await bot.sendMessage(chatId, msg, { parse_mode:"Markdown" }); }
-    catch(e) { logger.error("broadcastAlert to " + chatId + ": " + e.message); }
+    try { await bot.sendMessage(chatId, text, { parse_mode: "Markdown" }); }
+    catch (e) { logger.error("broadcastAlert to " + chatId + ": " + e.message); }
   }
+}
+
+function priceFmt(symbol) {
+  const hi = ["JPY","XAU","XAG","BTC","ETH","OIL","WTI","SPX","NAS","US30","DAX"];
+  if (hi.some(k => (symbol||"").toUpperCase().includes(k))) return n => Number(n).toFixed(2);
+  return n => Number(n).toFixed(5);
 }
 
 module.exports = { initBot, broadcastSignal, broadcastAlert };
