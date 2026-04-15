@@ -5,7 +5,7 @@
 // Also watches active signals for invalidation.
 // ─────────────────────────────────────────────────────────────────────────────
 
-const { fetchCurrentPrice, fetchAllTimeframes } = require("./dataProvider");
+const { fetchCurrentPrice, fetchAllTimeframes, fetchPriceBatch } = require("./dataProvider");
 const { detectBias, checkInvalidation, calculateZones,
         getPriceZone, calculateSL, calculateTargets,
         candlesAfter } = require("../engine/biasEngine");
@@ -78,11 +78,15 @@ async function runWatchCycle() {
   allSetups.forEach(s  => symbols.add(s.symbol + "|" + s.displayName));
   allSignals.forEach(s => symbols.add(s.symbol + "|" + s.displayName));
 
+  // Fetch all prices in one Twelve Data batch call — 1 API credit total
+  const symbolList = Array.from(symbols).map(e => e.split("|")[0]);
+  const priceMap   = await fetchPriceBatch(symbolList);
+
   for (const entry of symbols) {
     const [symbol, displayName] = entry.split("|");
     try {
-      const price = await fetchCurrentPrice(symbol);
-      if (!price) continue;
+      const price = priceMap[symbol];
+      if (!price) { logger.debug("No price for "+symbol); continue; }
 
       // Check watching setups for this symbol
       for (const [key, setup] of watchingSetups) {
@@ -99,8 +103,6 @@ async function runWatchCycle() {
     } catch (e) {
       logger.error("Watch cycle [" + displayName + "]: " + e.message);
     }
-
-    await sleep(500); // small gap between symbols
   }
 }
 

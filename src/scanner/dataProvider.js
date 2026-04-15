@@ -11,16 +11,29 @@ const PROVIDER = process.env.DATA_PROVIDER || "mock";
 const API_KEY  = process.env.TWELVE_DATA_API_KEY || "";
 const BASE_URL = "https://api.twelvedata.com";
 
-// Delay between calls: free tier = 8/min = 7500ms gap
-// But we batch all TFs in one call using the comma-separated symbol trick
-// Keep at 2000ms — safe and fast enough
-const DELAY = parseInt(process.env.API_CALL_DELAY_MS || "2000");
-let lastCall = 0;
+// Strict rate limiter — never exceed 7 calls per 60 seconds
+// Free tier = 8/min. We cap at 7 as safety margin.
+// IMPORTANT: Twelve Data counts each comma-separated interval as a separate credit.
+// So interval=1day,4h,1h,15min,5min = 5 credits NOT 1.
+// We send each timeframe as a separate request to have full visibility and control.
+const MAX_PER_MIN = parseInt(process.env.API_RATE_LIMIT || "7");
+const callLog = []; // rolling window
 
 async function throttle() {
-  const gap = Date.now() - lastCall;
-  if (lastCall && gap < DELAY) await sleep(DELAY - gap);
-  lastCall = Date.now();
+  const now = Date.now();
+  const win = 60000;
+  // Drop timestamps older than 60s
+  while (callLog.length && now - callLog[0] > win) callLog.shift();
+  // If at limit, wait until oldest drops out
+  if (callLog.length >= MAX_PER_MIN) {
+    const waitMs = (callLog[0] + win + 50) - Date.now();
+    if (waitMs > 0) {
+      logger.debug("Rate limit " + callLog.length + "/" + MAX_PER_MIN + " — waiting " + Math.ceil(waitMs/1000) + "s");
+      await sleep(waitMs);
+    }
+    while (callLog.length && Date.now() - callLog[0] > win) callLog.shift();
+  }
+  callLog.push(Date.now());
 }
 
 // Cache: 5-min TTL — candles don't change that fast
@@ -57,58 +70,32 @@ async function fetchAllTimeframes(symbol, timeframes, count = 10) {
 
   const sym = tdSym(symbol);
   logger.info("Fetching "+sym+" ["+needed.join(",")+"]");
-  await throttle();
 
-  try {
-    const res = await axios.get(BASE_URL+"/time_series", {
-      params: {
-        symbol:     sym,
-        interval:   needed.join(","),
-        outputsize: count,
-        apikey:     API_KEY,
-        format:     "JSON",
-      },
-      timeout: 20000,
-      validateStatus: () => true,
-    });
+  // Fetch each timeframe as a separate request — 1 credit each, fully rate controlled
+  for (const tf of needed) {
+    await throttle(); // enforces max 7/min globally
+    try {
+      const res = await axios.get(BASE_URL+"/time_series", {
+        params: { symbol:sym, interval:tf, outputsize:count, apikey:API_KEY, format:"JSON" },
+        timeout: 15000,
+        validateStatus: () => true,
+      });
 
-    if (!res || !res.data) {
-      logger.warn(sym+": empty response");
-      return result;
+      if (!res || !res.data) { logger.warn(sym+" "+tf+": empty response"); continue; }
+      if (res.status === 401) { logger.error("API key invalid — stopping"); return result; }
+      if (res.status === 429) { logger.warn(sym+" "+tf+": rate limited (429)"); continue; }
+      if (res.status !== 200) { logger.warn(sym+" "+tf+": HTTP "+res.status); continue; }
+
+      const d = res.data;
+      if (d.status === "error") { logger.warn(sym+" "+tf+": "+d.message); continue; }
+      if (!d.values || !d.values.length) { logger.warn(sym+" "+tf+": no values"); continue; }
+
+      result[tf] = toCache(symbol+"_"+tf, parseCandles(d.values));
+      logger.debug(sym+" "+tf+": "+result[tf].length+" candles OK");
+
+    } catch(e) {
+      logger.error(sym+" "+tf+": "+e.message);
     }
-
-    if (res.status === 401) { logger.error("Invalid API key"); return result; }
-    if (res.status === 429) { logger.warn(sym+": rate limited"); return result; }
-    if (res.status !== 200) { logger.warn(sym+": HTTP "+res.status); return result; }
-
-    const data = res.data;
-
-    // When multiple intervals requested, Twelve Data returns an object keyed by interval
-    // When single interval, returns the series directly
-    if (needed.length === 1) {
-      const tf = needed[0];
-      if (data.status === "error") {
-        logger.warn(sym+" "+tf+": "+data.message);
-      } else if (data.values && data.values.length) {
-        result[tf] = toCache(symbol+"_"+tf, parseCandles(data.values));
-        logger.debug(sym+" "+tf+": "+result[tf].length+" candles");
-      } else {
-        logger.warn(sym+" "+tf+": no values in response. Keys: "+Object.keys(data).join(","));
-      }
-    } else {
-      // Multiple intervals — response is keyed by interval name
-      for (const tf of needed) {
-        const d = data[tf];
-        if (!d) { logger.warn(sym+" "+tf+": not in response"); continue; }
-        if (d.status === "error") { logger.warn(sym+" "+tf+": "+d.message); continue; }
-        if (!d.values || !d.values.length) { logger.warn(sym+" "+tf+": no values"); continue; }
-        result[tf] = toCache(symbol+"_"+tf, parseCandles(d.values));
-        logger.debug(sym+" "+tf+": "+result[tf].length+" candles");
-      }
-    }
-
-  } catch(e) {
-    logger.error(sym+": "+e.message);
   }
 
   return result;
@@ -224,4 +211,57 @@ function mockPrice(s) { const b=BASES[s]||1.0; return R(b+(Math.random()-.5)*b*.
 function R(n,b) { return b>=100?Math.round(n*100)/100:Math.round(n*100000)/100000; }
 function sleep(ms) { return new Promise(r=>setTimeout(r,ms)); }
 
-module.exports = { fetchCandles, fetchCurrentPrice, isTimeframeAvailable, validateConnection, fetchAllTimeframes };
+// Fetch prices for multiple symbols in ONE API call
+// Twelve Data: GET /price?symbol=EUR/USD,GBP/USD,XAU/USD — counts as 1 credit
+async function fetchPriceBatch(symbols) {
+  if (PROVIDER === "mock") {
+    const out = {};
+    for (const s of symbols) out[s] = mockPrice(s);
+    return out;
+  }
+
+  // Check cache first — return cached values, only fetch what's missing
+  const out     = {};
+  const missing = [];
+  for (const s of symbols) {
+    let found = null;
+    for (const tf of ["5min","15min","1h","4h","1day"]) {
+      const c = fromCache(s+"_"+tf);
+      if (c && c.length) { found = c[c.length-1].close; break; }
+    }
+    if (found) out[s] = found; else missing.push(s);
+  }
+  if (!missing.length) return out;
+
+  // Batch price call — 1 credit for all symbols
+  await throttle();
+  try {
+    const res = await axios.get(BASE_URL+"/price", {
+      params: { symbol: missing.map(tdSym).join(","), apikey: API_KEY },
+      timeout: 10000,
+      validateStatus: () => true,
+    });
+
+    if (!res || res.status !== 200 || !res.data) return out;
+
+    // Response is either a single object {price:"..."} or array of {symbol,price}
+    const data = res.data;
+    if (Array.isArray(data)) {
+      for (const item of data) {
+        if (item.symbol && item.price) {
+          // Map back from Twelve Data symbol to our symbol
+          const ourSym = missing.find(s => tdSym(s) === item.symbol) || item.symbol;
+          out[ourSym] = parseFloat(item.price);
+        }
+      }
+    } else if (data.price) {
+      // Single symbol response
+      if (missing.length === 1) out[missing[0]] = parseFloat(data.price);
+    }
+  } catch(e) {
+    logger.warn("fetchPriceBatch: "+e.message);
+  }
+  return out;
+}
+
+module.exports = { fetchCandles, fetchCurrentPrice, fetchPriceBatch, isTimeframeAvailable, validateConnection, fetchAllTimeframes };
